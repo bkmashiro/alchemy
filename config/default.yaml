@@ -1,0 +1,43 @@
+# Alchemy Configuration
+# Place at ~/.alchemy/config.yaml or ./alchemy.config.yaml
+
+executor:
+  type: slurm_ssh
+  jumpHost: shell2
+  computeHost: gpucluster2
+  user: ys25
+  projectRoot: /vol/bitbucket/ys25/jema
+  logDir: /vol/bitbucket/ys25/jema/logs
+  condaEnvBin: /vol/bitbucket/ys25/conda-envs/jema/bin
+  defaultEnv:
+    TORCH_HOME: /vol/bitbucket/ys25/.cache/torch
+    XDG_CACHE_HOME: /vol/bitbucket/ys25/.cache
+  connectTimeout: 10000
+
+notifiers:
+  - type: discord_webhook
+    url: https://discord.com/api/webhooks/XXXX/YYYY
+    mentionId: "<@1477359696129163506>"
+    includeTraceback: true
+
+analyzers:
+  - type: metrics_extractor
+    patterns:
+      # PyTorch Lightning style
+      - "(?P<key>val_acc|val_loss|train_loss|train_acc)[=:\\s]+(?P<value>[0-9.]+)"
+      # Epoch tracking
+      - "epoch[=:\\s]+(?P<value>[0-9]+)"
+      # Generic key=value
+      - "(?P<key>[a-z_]+)[=:\\s]+(?P<value>[0-9]+\\.?[0-9]*)"
+  - type: auto_submit
+    enabled: true
+
+webhook:
+  port: 3457
+  publicUrl: https://your-tunnel.ngrok.io
+
+registry:
+  path: ~/.alchemy/registry.db
+
+dashboard:
+  port: 3456
