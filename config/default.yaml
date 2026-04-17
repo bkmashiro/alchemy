@@ -1,0 +1,68 @@
+# Alchemy Configuration
+# Place at ~/.alchemy/config.yaml or ./alchemy.config.yaml
+# Copy this file and fill in your cluster details.
+
+executor:
+  type: slurm_ssh
+  # SSH jump host (use your SSH config name or user@host)
+  jumpHost: shell2
+  # Compute cluster host (reachable from jump host)
+  computeHost: gpucluster2
+  # Your username on the cluster
+  user: ys25
+  # Project root directory on the cluster
+  projectRoot: /vol/bitbucket/ys25/jema
+  # Directory where Slurm log files are written
+  logDir: /vol/bitbucket/ys25/jema/logs
+  # Conda/venv bin path prepended to PATH in job scripts
+  condaEnvBin: /vol/bitbucket/ys25/conda-envs/jema/bin
+  # Default environment variables set in every job
+  defaultEnv:
+    TORCH_HOME: /vol/bitbucket/ys25/.cache/torch
+    XDG_CACHE_HOME: /vol/bitbucket/ys25/.cache
+  # SSH connection timeout in milliseconds
+  connectTimeout: 10000
+  # Optional: path to SSH private key (omit to use ssh-agent)
+  # privateKeyPath: ~/.ssh/id_ed25519
+
+notifiers:
+  - type: discord_webhook
+    # Your Discord webhook URL
+    url: https://discord.com/api/webhooks/XXXX/YYYY
+    # Discord user/role to mention (optional)
+    mentionId: "<@1477359696129163506>"
+    # Include error tracebacks in failure messages
+    includeTraceback: true
+
+analyzers:
+  - type: metrics_extractor
+    # Regex patterns to extract metrics from job log output.
+    # Each pattern should have named groups: key (optional) and value (required).
+    patterns:
+      # PyTorch Lightning / general: "val_acc=0.8567" or "val_acc: 0.8567"
+      - "(?P<key>val_acc|val_loss|train_loss|train_acc)[=:\\s]+(?P<value>[0-9.]+)"
+      # Epoch tracking
+      - "epoch[=:\\s]+(?P<value>[0-9]+)"
+      # Generic key=value pairs
+      - "(?P<key>[a-z_]+)[=:\\s]+(?P<value>[0-9]+\\.?[0-9]*)"
+
+  - type: auto_submit
+    enabled: true
+
+webhook:
+  # Port for the webhook HTTP server
+  port: 3457
+  # Public URL where this machine is reachable from the cluster.
+  # Use ngrok, Cloudflare Tunnel, or similar:
+  #   ngrok http 3457  → copy the HTTPS URL here
+  publicUrl: https://your-tunnel.ngrok.io
+  # Optional shared secret for HMAC verification
+  # secret: your-secret-here
+
+registry:
+  # Path to the SQLite database file
+  path: ~/.alchemy/registry.db
+
+dashboard:
+  # Port for the web dashboard
+  port: 3456

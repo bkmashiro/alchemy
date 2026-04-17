@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alchemy Dashboard</title>
+  <style>
+    :root {
+      --bg-primary: #0d1117;
+      --bg-secondary: #161b22;
+      --bg-tertiary: #21262d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #d29922;
+      --blue: #58a6ff;
+      --purple: #bc8cff;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    header h1 { font-size: 1.4rem; letter-spacing: -0.5px; }
+
+    #summary-bar {
+      display: flex;
+      gap: 20px;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+
+    #summary-bar .stat { display: flex; align-items: center; gap: 6px; }
+    #summary-bar .count { font-weight: 700; color: var(--text-primary); font-size: 1rem; }
+    #summary-bar .running .count { color: var(--blue); }
+    #summary-bar .failed .count { color: var(--red); }
+    #summary-bar .completed .count { color: var(--green); }
+
+    #connection-status {
+      font-size: 0.75rem;
+      padding: 3px 8px;
+      border-radius: 12px;
+    }
+    #connection-status.ok { background: rgba(63,185,80,0.15); color: var(--green); }
+    #connection-status.err { background: rgba(248,81,73,0.15); color: var(--red); }
+
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+    section { margin-bottom: 32px; }
+
+    h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* Filter buttons */
+    #jobs-filter {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .filter-btn {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      transition: all 0.15s;
+    }
+    .filter-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+    .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+    /* Jobs table */
+    #jobs-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+
+    #jobs-table th {
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 2px solid var(--border);
+      color: var(--text-secondary);
+      font-weight: 600;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    #jobs-table td {
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    #jobs-table tr:hover td { background: var(--bg-tertiary); cursor: pointer; }
+    #jobs-table tr.selected td { background: rgba(88, 166, 255, 0.08); }
+
+    /* Status badges */
+    .status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .status-running  { background: rgba(88,166,255,0.15); color: var(--blue); }
+    .status-submitted { background: rgba(88,166,255,0.1); color: var(--blue); }
+    .status-pending  { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .status-completed{ background: rgba(63,185,80,0.15);  color: var(--green); }
+    .status-failed   { background: rgba(248,81,73,0.15);  color: var(--red); }
+    .status-timeout  { background: rgba(248,81,73,0.10);  color: var(--red); }
+    .status-cancelled{ background: rgba(139,148,158,0.15);color: var(--text-secondary); }
+    .status-unknown  { background: rgba(139,148,158,0.10);color: var(--text-secondary); }
+
+    /* Chain cards */
+    #chains-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 12px;
+    }
+
+    .chain-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      transition: border-color 0.15s;
+    }
+    .chain-card:hover { border-color: var(--accent); }
+
+    .chain-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+    .chain-card-title { font-weight: 600; font-size: 0.95rem; }
+    .chain-card-meta {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
+    }
+
+    .chain-progress-bar {
+      height: 6px;
+      background: var(--bg-tertiary);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    .chain-progress-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.4s ease;
+    }
+    .chain-progress-label {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* Log panel */
+    #log-panel {
+      position: fixed;
+      right: 0;
+      top: 0;
+      bottom: 0;
+      width: 46%;
+      min-width: 400px;
+      max-width: 800px;
+      background: var(--bg-secondary);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      z-index: 100;
+      transition: transform 0.2s ease;
+    }
+    #log-panel.hidden { transform: translateX(100%); }
+
+    #log-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-tertiary);
+    }
+    #log-job-name { font-weight: 600; font-size: 0.9rem; }
+    #log-close {
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 1.2rem;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    #log-close:hover { background: var(--border); color: var(--text-primary); }
+
+    #log-toolbar {
+      display: flex;
+      gap: 8px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+    }
+    #log-toolbar button {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      cursor: pointer;
+    }
+    #log-toolbar button:hover { color: var(--text-primary); border-color: var(--accent); }
+    #log-status { font-size: 0.78rem; color: var(--text-secondary); margin-left: auto; }
+
+    #log-content {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+      font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+      font-size: 0.78rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      color: var(--text-secondary);
+    }
+
+    /* Submit modal */
+    #submit-modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+    }
+    #submit-modal.hidden { display: none; }
+
+    .modal-content {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      width: 640px;
+      max-height: 85vh;
+      overflow: auto;
+    }
+    .modal-content h3 { font-size: 1.1rem; margin-bottom: 12px; }
+
+    #yaml-editor {
+      width: 100%;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      font-family: 'SF Mono', 'Consolas', monospace;
+      font-size: 0.82rem;
+      resize: vertical;
+      min-height: 280px;
+    }
+    #yaml-editor:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+    .modal-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      align-items: center;
+    }
+    .modal-actions button {
+      padding: 8px 18px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      font-size: 0.88rem;
+      transition: all 0.15s;
+    }
+    #submit-btn { background: var(--green); color: #fff; border-color: var(--green); }
+    #submit-btn:hover { filter: brightness(1.1); }
+    #submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #cancel-modal-btn { background: var(--bg-tertiary); color: var(--text-secondary); }
+    #cancel-modal-btn:hover { color: var(--text-primary); }
+
+    #submit-result {
+      margin-top: 10px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+    #submit-result.hidden { display: none; }
+
+    /* Empty state */
+    .empty-state {
+      padding: 32px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+
+    /* Floating action button */
+    footer {
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      z-index: 40;
+    }
+
+    #open-submit-modal {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 12px 22px;
+      border-radius: 10px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+      transition: all 0.15s;
+    }
+    #open-submit-modal:hover { filter: brightness(1.1); transform: translateY(-1px); }
+
+    /* Utility */
+    code { font-family: 'SF Mono', 'Consolas', monospace; font-size: 0.85em; color: var(--accent); }
+    .dim { color: var(--text-secondary); }
+    .no-wrap { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⚗️ Alchemy</h1>
+    <div id="summary-bar">
+      <span class="stat running">🔄 Running: <span class="count" id="stat-running">—</span></span>
+      <span class="stat pending">⏳ Pending: <span class="count" id="stat-pending">—</span></span>
+      <span class="stat completed">✅ Done: <span class="count" id="stat-completed">—</span></span>
+      <span class="stat failed">❌ Failed: <span class="count" id="stat-failed">—</span></span>
+    </div>
+    <span id="connection-status" class="ok">● live</span>
+  </header>
+
+  <main>
+    <section id="chains-section">
+      <h2>Chains</h2>
+      <div id="chains-list">
+        <div class="empty-state">Loading chains...</div>
+      </div>
+    </section>
+
+    <section id="jobs-section">
+      <h2>Jobs</h2>
+      <div id="jobs-filter">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="running">Running</button>
+        <button class="filter-btn" data-filter="pending">Pending</button>
+        <button class="filter-btn" data-filter="failed">Failed</button>
+        <button class="filter-btn" data-filter="completed">Completed</button>
+      </div>
+      <table id="jobs-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Slurm ID</th>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Partition</th>
+            <th>Node</th>
+            <th>Elapsed</th>
+            <th>Created</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-tbody">
+          <tr><td colspan="8" class="empty-state">Loading jobs...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <!-- Log viewer panel -->
+  <aside id="log-panel" class="hidden">
+    <div id="log-header">
+      <span id="log-job-name">Job Logs</span>
+      <button id="log-close" title="Close">&times;</button>
+    </div>
+    <div id="log-toolbar">
+      <button id="log-refresh-btn">↻ Refresh</button>
+      <button id="log-copy-btn">⎘ Copy</button>
+      <span id="log-status"></span>
+    </div>
+    <pre id="log-content">(select a job to view logs)</pre>
+  </aside>
+
+  <!-- Submit modal -->
+  <div id="submit-modal" class="hidden">
+    <div class="modal-content">
+      <h3>⚗️ Submit Job or Chain</h3>
+      <textarea id="yaml-editor" placeholder="Paste YAML here...&#10;&#10;version: &quot;1&quot;&#10;job:&#10;  name: my_job&#10;  command: &quot;python train.py&quot;&#10;  resources:&#10;    partition: t4&#10;    time: &quot;01:00:00&quot;&#10;    mem: 16G&#10;    gpus: 1"></textarea>
+      <div class="modal-actions">
+        <button id="submit-btn">Submit</button>
+        <button id="cancel-modal-btn">Cancel</button>
+      </div>
+      <div id="submit-result" class="hidden"></div>
+    </div>
+  </div>
+
+  <footer>
+    <button id="open-submit-modal">+ Submit Job</button>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
