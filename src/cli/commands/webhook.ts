@@ -4,6 +4,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { loadConfig } from '../../core/config.js';
+import { tunnelManager } from '../../tunnel/index.js';
 
 export function registerWebhookCommand(program: Command): void {
   program
@@ -25,23 +26,42 @@ export function registerWebhookCommand(program: Command): void {
         : (config.webhook.port ?? 3457);
 
       console.log(chalk.cyan(`Starting Alchemy Webhook Receiver on port ${port}...`));
-      console.log(chalk.dim(`Public URL: ${config.webhook.publicUrl}`));
-      console.log(chalk.dim(`Registered endpoint: ${config.webhook.publicUrl}/api/webhook/job-event`));
+
+      // Attempt to start a tunnel
+      let webhookPublicUrl: string | null = null;
+      let usingPolling = false;
+
+      try {
+        webhookPublicUrl = await tunnelManager.start(port);
+      } catch (err) {
+        console.error(chalk.yellow(`Tunnel error: ${String(err)}`));
+      }
+
+      if (webhookPublicUrl) {
+        console.log(chalk.green(`Tunnel: ${webhookPublicUrl}`));
+        console.log(chalk.dim(`Registered endpoint: ${webhookPublicUrl}/api/webhook/job-event`));
+      } else {
+        console.log(chalk.yellow('No tunnel available, falling back to polling (30s interval)'));
+        usingPolling = true;
+      }
 
       try {
         // Dynamic import to avoid loading all of Agent B's code at startup
         const { createWebhookServer } = await import('../../webhook/server.js');
+        const { AlchemyOrchestrator } = await import('../../core/orchestrator.js');
 
-        // Orchestrator is required for the webhook server but is Agent A's responsibility.
-        // For now, we create a minimal placeholder that logs events.
-        const placeholderOrchestrator = {
-          handleWebhookEvent: async (payload: unknown) => {
-            console.log(chalk.dim(`Webhook received: ${JSON.stringify(payload)}`));
-          },
-        };
+        const orchestrator = new AlchemyOrchestrator(config);
+        await orchestrator.initialize();
+
+        if (usingPolling) {
+          orchestrator.startPolling(30_000);
+        }
+
+        const effectivePublicUrl = webhookPublicUrl ?? config.webhook.publicUrl;
+        console.log(chalk.dim(`Public URL: ${effectivePublicUrl}`));
 
         await createWebhookServer(
-          placeholderOrchestrator as never,
+          orchestrator,
           port,
           config.webhook.secret,
         );
@@ -50,20 +70,23 @@ export function registerWebhookCommand(program: Command): void {
         console.log(chalk.dim('Listening for job completion callbacks from the cluster.'));
         console.log(chalk.dim('Press Ctrl+C to stop.'));
 
-        process.on('SIGINT', () => {
+        const shutdown = async () => {
           console.log('\nShutting down webhook receiver...');
+          tunnelManager.stop();
+          orchestrator.stopPolling();
+          await orchestrator.destroy();
           process.exit(0);
-        });
+        };
 
-        process.on('SIGTERM', () => {
-          process.exit(0);
-        });
+        process.on('SIGINT', () => { void shutdown(); });
+        process.on('SIGTERM', () => { void shutdown(); });
 
         await new Promise<void>(() => {});
       } catch (err) {
         // Graceful degradation if Agent B's webhook server isn't available yet
         console.error(chalk.yellow(`Note: Full webhook server requires Agent B's implementation.`));
         console.error(chalk.red(`Error: ${String(err)}`));
+        tunnelManager.stop();
         process.exit(1);
       }
     });

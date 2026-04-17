@@ -35,6 +35,7 @@ export class AlchemyOrchestrator {
   private config: AlchemyConfig;
   private logger: pino.Logger;
   private initialized = false;
+  private pollTimer: NodeJS.Timeout | null = null;
 
   constructor(config: AlchemyConfig) {
     this.config = config;
@@ -237,53 +238,7 @@ export class AlchemyOrchestrator {
       newStatus === JobStatus.FAILED ||
       newStatus === JobStatus.TIMEOUT
     ) {
-      const updatedJob = this.registry.getJob(job.id);
-
-      // Fetch logs
-      let logContent = '';
-      if (updatedJob.logPath) {
-        try {
-          logContent = await this.executor.fetchLogs(updatedJob.logPath, 200);
-        } catch (err) {
-          this.logger.warn({ jobId: job.id, err }, 'Failed to fetch logs');
-        }
-      }
-
-      // Run analyzer chain
-      let analysisResult: AnalysisResult = {
-        jobId: job.id,
-        metrics: {},
-        shouldContinueChain: newStatus === JobStatus.COMPLETED,
-        summary: '',
-      };
-      for (const analyzer of this.analyzers) {
-        analysisResult = await analyzer.analyze(updatedJob, logContent, analysisResult);
-      }
-
-      // Store metrics
-      if (Object.keys(analysisResult.metrics).length > 0) {
-        this.registry.setMetrics(job.id, analysisResult.metrics);
-        this.registry.updateJob(job.id, { metrics: analysisResult.metrics });
-      }
-
-      // Notify
-      for (const notifier of this.notifiers) {
-        try {
-          if (newStatus === JobStatus.COMPLETED) {
-            await notifier.notifyJobCompleted(updatedJob);
-          } else {
-            const logTail = logContent.split('\n').slice(-20).join('\n');
-            await notifier.notifyJobFailed(updatedJob, logTail);
-          }
-        } catch (err) {
-          this.logger.error({ notifierType: notifier.type, err }, 'Notifier failed');
-        }
-      }
-
-      // Advance chain if applicable
-      if (updatedJob.chainId) {
-        await this.advanceChain(updatedJob.chainId, analysisResult);
-      }
+      await this.handleTerminalJob(this.registry.getJob(job.id), newStatus);
     }
 
     // Started status → notify
@@ -295,6 +250,132 @@ export class AlchemyOrchestrator {
         } catch (err) {
           this.logger.error({ notifierType: notifier.type, err }, 'Notifier failed');
         }
+      }
+    }
+  }
+
+  /**
+   * Handle a job that has reached a terminal state (COMPLETED/FAILED/TIMEOUT).
+   * Fetches logs, runs analyzers, sends notifications, and advances the chain.
+   */
+  private async handleTerminalJob(
+    job: import('./types.js').JobRecord,
+    newStatus: JobStatus,
+    elapsed?: number,
+  ): Promise<void> {
+    // Apply optional elapsed update from polling
+    if (elapsed !== undefined) {
+      this.registry.updateJob(job.id, { elapsed });
+    }
+    const updatedJob = this.registry.getJob(job.id);
+
+    // Fetch logs
+    let logContent = '';
+    if (updatedJob.logPath) {
+      try {
+        logContent = await this.executor.fetchLogs(updatedJob.logPath, 200);
+      } catch (err) {
+        this.logger.warn({ jobId: job.id, err }, 'Failed to fetch logs');
+      }
+    }
+
+    // Run analyzer chain
+    let analysisResult: AnalysisResult = {
+      jobId: job.id,
+      metrics: {},
+      shouldContinueChain: newStatus === JobStatus.COMPLETED,
+      summary: '',
+    };
+    for (const analyzer of this.analyzers) {
+      analysisResult = await analyzer.analyze(updatedJob, logContent, analysisResult);
+    }
+
+    // Store metrics
+    if (Object.keys(analysisResult.metrics).length > 0) {
+      this.registry.setMetrics(job.id, analysisResult.metrics);
+      this.registry.updateJob(job.id, { metrics: analysisResult.metrics });
+    }
+
+    // Notify
+    for (const notifier of this.notifiers) {
+      try {
+        if (newStatus === JobStatus.COMPLETED) {
+          await notifier.notifyJobCompleted(updatedJob);
+        } else {
+          const logTail = logContent.split('\n').slice(-20).join('\n');
+          await notifier.notifyJobFailed(updatedJob, logTail);
+        }
+      } catch (err) {
+        this.logger.error({ notifierType: notifier.type, err }, 'Notifier failed');
+      }
+    }
+
+    // Advance chain if applicable
+    if (updatedJob.chainId) {
+      await this.advanceChain(updatedJob.chainId, analysisResult);
+    }
+  }
+
+  /**
+   * Start periodic polling for PENDING/RUNNING/SUBMITTED jobs.
+   * Used as fallback when no webhook tunnel is available.
+   * @param intervalMs - poll interval in ms (default 30000)
+   */
+  startPolling(intervalMs = 30_000): void {
+    if (this.pollTimer !== null) return;
+    this.logger.info({ intervalMs }, 'Starting polling fallback');
+    this.pollTimer = setInterval(() => {
+      this.pollJobs().catch((err) => {
+        this.logger.error({ err }, 'Error during poll cycle');
+      });
+    }, intervalMs);
+  }
+
+  /** Stop polling */
+  stopPolling(): void {
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+      this.logger.info('Polling stopped');
+    }
+  }
+
+  /** Poll all active jobs and handle any that have reached a terminal state */
+  private async pollJobs(): Promise<void> {
+    const { jobs } = this.registry.listJobs({
+      status: [JobStatus.PENDING, JobStatus.SUBMITTED, JobStatus.RUNNING],
+      limit: 200,
+    });
+
+    for (const job of jobs) {
+      if (!job.slurmJobId) continue;
+      try {
+        const result = await this.executor.status(job.slurmJobId);
+        if (result.status === job.status) continue;
+
+        this.logger.info(
+          { jobId: job.id, slurmJobId: job.slurmJobId, oldStatus: job.status, newStatus: result.status },
+          'Job status changed (poll)',
+        );
+
+        this.registry.updateJob(job.id, {
+          status: result.status,
+          exitCode: result.exitCode,
+          node: result.node,
+          elapsed: result.elapsed,
+        });
+
+        const isTerminal =
+          result.status === JobStatus.COMPLETED ||
+          result.status === JobStatus.FAILED ||
+          result.status === JobStatus.TIMEOUT ||
+          result.status === JobStatus.CANCELLED;
+
+        if (isTerminal) {
+          await this.handleTerminalJob(this.registry.getJob(job.id), result.status, result.elapsed);
+        }
+      } catch (err) {
+        this.logger.warn({ jobId: job.id, slurmJobId: job.slurmJobId, err }, 'Failed to poll job status');
       }
     }
   }
