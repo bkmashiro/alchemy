@@ -1,5 +1,4 @@
 // src/strategies/base.ts
-// NOTE: This file is owned by Agent B. This is a stub for compilation purposes.
 
 import {
   ChainSpec,
@@ -24,11 +23,24 @@ export interface NextSteps {
 
 /**
  * Abstract base class for chain strategies.
+ *
+ * A ChainStrategy decides, given the current state of all jobs in a chain,
+ * which steps should be submitted next. It does NOT submit jobs itself —
+ * it returns NextSteps and the Orchestrator does the rest.
  */
 export abstract class BaseChainStrategy {
   /** Strategy type identifier (matches ChainStrategyType enum) */
   abstract readonly type: string;
 
+  /**
+   * Given the chain spec and the current state of all jobs,
+   * determine which steps should run next.
+   *
+   * @param chain - The chain specification
+   * @param jobsByStepId - Map from stepId → JobRecord (for completed/running jobs)
+   * @param analysisResults - Map from stepId → AnalysisResult (for completed jobs that were analyzed)
+   * @returns Which steps are ready, and whether the chain is done
+   */
   abstract getNextSteps(
     chain: ChainSpec,
     jobsByStepId: Map<string, JobRecord>,
