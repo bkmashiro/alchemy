@@ -1,0 +1,80 @@
+# Example: Learning Rate Sweep Chain
+# Submit with: alchemy submit config/example-chain.yaml
+#
+# This example sweeps over 4 learning rates × 2 batch sizes = 8 total jobs,
+# then runs a final evaluation after all sweep jobs complete.
+
+version: "1"
+
+chain:
+  name: lr_sweep_v1
+  strategy: sweep
+  # Run up to 4 sweep jobs in parallel
+  maxConcurrent: 4
+  # Stop all jobs if one fails
+  failFast: false
+
+  # The parameter grid — all combinations are submitted
+  sweepGrid:
+    lr: [0.001, 0.0003, 0.0001, 0.00003]
+    batch_size: [32, 64]
+
+  # Template job — {{lr}} and {{batch_size}} are replaced with grid values
+  sweepBaseJob:
+    name: "sweep_lr{{lr}}_bs{{batch_size}}"
+    command: "python train.py --lr {{lr}} --batch-size {{batch_size}} --epochs 50"
+    resources:
+      partition: a30
+      time: "02:00:00"
+      mem: 32G
+      gpus: 1
+    tags: [sweep, lr_search]
+
+---
+# Alternative: Sequential training pipeline with conditional steps
+
+# version: "1"
+#
+# chain:
+#   name: train_eval_pipeline
+#   strategy: sequential
+#   failFast: true
+#
+#   steps:
+#     - stepId: train_phase1
+#       job:
+#         name: train_p1
+#         command: "python train.py --phase 1 --epochs 50 --config configs/minigrid.yaml"
+#         resources:
+#           partition: a30
+#           time: "04:00:00"
+#           mem: 32G
+#           gpus: 1
+#         tags: [training, phase1]
+#
+#     - stepId: eval_phase1
+#       dependsOn: [train_phase1]
+#       # Only run eval if training completed with val_acc > 0.6
+#       condition: "metrics.val_acc > 0.6"
+#       job:
+#         name: eval_p1
+#         command: "python eval.py --checkpoint results/phase1/best.pt --full"
+#         resources:
+#           partition: t4
+#           time: "00:30:00"
+#           mem: 16G
+#           gpus: 1
+#         tags: [eval, phase1]
+#
+#     - stepId: train_phase2
+#       dependsOn: [eval_phase1]
+#       condition: "metrics.val_acc > 0.7"
+#       job:
+#         name: train_p2
+#         command: "python train.py --phase 2 --epochs 100 --resume results/phase1/best.pt"
+#         resources:
+#           partition: a30
+#           time: "08:00:00"
+#           mem: 64G
+#           gpus: 4
+#         tags: [training, phase2]

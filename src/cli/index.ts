@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // src/cli/index.ts
+// Commander.js entry point — registers all subcommands.
 
 import { Command } from 'commander';
 
