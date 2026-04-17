@@ -353,6 +353,20 @@ See `config/default.yaml` for the full annotated configuration file.
 | `dashboard.port` | number | `3456` | Dashboard server port |
 | `registry.path` | string | `~/.alchemy/registry.db` | SQLite database path |
 
+## MCP Integration
+
+Add to your Claude config:
+
+```json
+{
+  "mcpServers": {
+    "alchemy": {
+      "command": "alchemy-mcp"
+    }
+  }
+}
+```
+
 ## Requirements
 
 - Node.js >= 20

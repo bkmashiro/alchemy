@@ -41,7 +41,7 @@ export function registerWebhookCommand(program: Command): void {
         console.log(chalk.green(`Tunnel: ${webhookPublicUrl}`));
         console.log(chalk.dim(`Registered endpoint: ${webhookPublicUrl}/api/webhook/job-event`));
       } else {
-        console.log(chalk.yellow('No tunnel available, falling back to polling (30s interval)'));
+        console.log(chalk.yellow('No tunnel available, falling back to polling'));
         usingPolling = true;
       }
 
@@ -53,8 +53,14 @@ export function registerWebhookCommand(program: Command): void {
         const orchestrator = new AlchemyOrchestrator(config);
         await orchestrator.initialize();
 
-        if (usingPolling) {
-          orchestrator.startPolling(30_000);
+        if (webhookPublicUrl) {
+          const intervalMs = 5 * 60 * 1000;
+          orchestrator.startPolling(intervalMs);
+          console.log(chalk.dim('Polling every 5m (backup)'));
+        } else {
+          const intervalMs = 30_000;
+          orchestrator.startPolling(intervalMs);
+          console.log(chalk.dim('Polling every 30s (primary)'));
         }
 
         const effectivePublicUrl = webhookPublicUrl ?? config.webhook.publicUrl;

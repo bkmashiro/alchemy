@@ -18,6 +18,7 @@ import { registerCancelCommand } from './commands/cancel.js';
 import { registerLsCommand } from './commands/ls.js';
 import { registerDashboardCommand } from './commands/dashboard.js';
 import { registerWebhookCommand } from './commands/webhook.js';
+import { registerMcpCommand } from './commands/mcp.js';
 
 const program = new Command()
   .name('alchemy')
@@ -32,5 +33,6 @@ registerCancelCommand(program);
 registerLsCommand(program);
 registerDashboardCommand(program);
 registerWebhookCommand(program);
+registerMcpCommand(program);
 
 program.parse();
