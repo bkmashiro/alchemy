@@ -6,6 +6,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { JobRegistry } from '../core/registry.js';
 import { JobStatus, ChainStatus } from '../core/types.js';
+import type { BaseExecutor } from '../executors/base.js';
 
 // ─── Query param schemas ──────────────────────────────────────
 
@@ -27,9 +28,17 @@ const LogsQuerySchema = z.object({
 });
 
 /**
- * Register all dashboard API routes.
+ * Resolve the executor for a given job based on its executorType.
  */
-export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry): void {
+function getExecutorForJob(executors: Map<string, BaseExecutor>, executorType: string): BaseExecutor | undefined {
+  return executors.get(executorType);
+}
+
+/**
+ * Register all dashboard API routes.
+ * @param executors Map of executor type → executor instance.
+ */
+export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry, executors: Map<string, BaseExecutor>): void {
   // ─── GET /api/summary ──────────────────────────────────────
 
   app.get('/api/summary', async (_req: FastifyRequest, reply: FastifyReply) => {
@@ -113,16 +122,35 @@ export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry): 
         return reply.send({ logs: '(No log path recorded for this job)' });
       }
 
-      // In production, this calls executor.fetchLogs(job.logPath, tailLines)
-      // For now, return a placeholder since we don't have the executor here
-      return reply.send({
-        logs:
-          `[Log retrieval via SSH is not available in dashboard-only mode]\n` +
-          `Job: ${job.spec.name}\n` +
-          `Status: ${job.status}\n` +
-          `Log path: ${job.logPath}\n` +
-          `\nUse 'alchemy logs ${id} --tail ${tailLines}' to fetch logs via CLI.`,
-      });
+      const executor = getExecutorForJob(executors, job.executorType);
+      if (!executor) {
+        return reply.send({
+          logs:
+            `[No executor available for type "${job.executorType}"]\n` +
+            `Job: ${job.spec.name}\n` +
+            `Status: ${job.status}\n` +
+            `Log path: ${job.logPath}\n` +
+            `\nUse 'alchemy logs ${id} --tail ${tailLines}' to fetch logs via CLI.`,
+        });
+      }
+
+      // Use executor to fetch logs
+      try {
+        let logs: string;
+        if (job.slurmJobId?.startsWith('ws:') && 'fetchLogsFromHost' in executor) {
+          const parts = job.slurmJobId.split(':');
+          const hostname = parts[1] ?? '';
+          const wsExecutor = executor as { fetchLogsFromHost(hostname: string, logPath: string, tailLines?: number): Promise<string> };
+          logs = await wsExecutor.fetchLogsFromHost(hostname, job.logPath, tailLines);
+        } else {
+          logs = await executor.fetchLogs(job.logPath, tailLines);
+        }
+        return reply.send({ logs: logs || '(Log file is empty or not yet written)' });
+      } catch (fetchErr) {
+        return reply.send({
+          logs: `(Failed to fetch logs via SSH: ${String(fetchErr)})\nLog path: ${job.logPath}`,
+        });
+      }
     } catch {
       return reply.status(404).send({ error: `Job not found: ${id}` });
     }
@@ -136,12 +164,36 @@ export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry): 
     try {
       const job = registry.getJob(id);
 
-      // In production, calls executor.cancel(job.slurmJobId!)
-      // then updates registry status to CANCELLED
+      if (
+        job.status === JobStatus.COMPLETED ||
+        job.status === JobStatus.CANCELLED ||
+        job.status === JobStatus.FAILED ||
+        job.status === JobStatus.TIMEOUT
+      ) {
+        return reply.status(400).send({ error: `Job is already in terminal state: ${job.status}` });
+      }
+
+      let executorCancelled = false;
+      let executorError: string | undefined;
+
+      const executor = getExecutorForJob(executors, job.executorType);
+      if (executor && job.slurmJobId) {
+        try {
+          await executor.cancel(job.slurmJobId);
+          executorCancelled = true;
+        } catch (cancelErr) {
+          executorError = String(cancelErr);
+        }
+      }
+
+      registry.updateJob(id, { status: JobStatus.CANCELLED });
+
       return reply.send({
         ok: true,
-        message: `Cancel requested for job ${job.spec.name} (${id})`,
-        note: 'Actual cancellation requires SSH executor. Run scancel manually.',
+        message: `Job ${job.spec.name} (${id}) cancelled`,
+        executorCancelled,
+        ...(executorError ? { executorError } : {}),
+        ...(!executor ? { note: 'No executor connection — registry updated only.' } : {}),
       });
     } catch {
       return reply.status(404).send({ error: `Job not found: ${id}` });

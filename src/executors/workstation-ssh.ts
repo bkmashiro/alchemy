@@ -274,7 +274,8 @@ ${spec.command}
     const scriptContent = this.generateWrapperScript(alchemyJobId, spec, logPath);
     const scriptPath = `${logDir}/.ws_${alchemyJobId}.sh`;
 
-    const writeCmd = `printf '%s' ${JSON.stringify(scriptContent)} > '${scriptPath}' && chmod +x '${scriptPath}'`;
+    const b64 = Buffer.from(scriptContent, 'utf-8').toString('base64');
+    const writeCmd = `echo '${b64}' | base64 -d > '${scriptPath}' && chmod +x '${scriptPath}'`;
     await this.execOnHost(hostname, writeCmd);
 
     try {
@@ -290,8 +291,8 @@ ${spec.command}
         );
       }
 
-      // Write PID file
-      await this.execOnHost(hostname, `echo '${pid}' > '${pidPath}'`);
+      // Write PID file and start timestamp
+      await this.execOnHost(hostname, `echo '${pid}' > '${pidPath}' && date +%s > '${pidPath}.start'`);
 
       const externalJobId = `ws:${hostname}:${pid}`;
       this.logger.info({ externalJobId, alchemyJobId, jobName: spec.name, host: hostname }, 'Job submitted');
@@ -312,20 +313,26 @@ ${spec.command}
 
     const { hostname, pid } = this.parseExternalJobId(externalJobId);
 
+    const logDir = `${this.config.projectRoot}/logs`;
+
     try {
-      // Check if process is still running
+      // Check process + read start timestamp in one SSH call
       const { stdout } = await this.execOnHost(
         hostname,
-        `kill -0 ${pid} 2>/dev/null && echo RUNNING || echo STOPPED`,
+        `kill -0 ${pid} 2>/dev/null && echo RUNNING || echo STOPPED; for f in ${logDir}/.ws_*.pid; do [ "$(cat "$f" 2>/dev/null)" = "${pid}" ] && cat "$f.start" 2>/dev/null && break; done; date +%s`,
       );
 
-      if (stdout.trim() === 'RUNNING') {
-        return { status: JobStatus.RUNNING, node: hostname };
+      const lines = stdout.trim().split('\n');
+      const state = lines[0];
+      const startTs = parseInt(lines[1] ?? '', 10);
+      const nowTs = parseInt(lines[2] ?? '', 10);
+      const elapsed = (!isNaN(startTs) && !isNaN(nowTs)) ? nowTs - startTs : undefined;
+
+      if (state === 'RUNNING') {
+        return { status: JobStatus.RUNNING, node: hostname, elapsed };
       }
 
-      // Process stopped — try to get exit code from wait or /proc
-      // Since we can't wait on a non-child process, check if the log ends with error indicators
-      return { status: JobStatus.COMPLETED, node: hostname };
+      return { status: JobStatus.COMPLETED, node: hostname, elapsed };
     } catch {
       return { status: JobStatus.UNKNOWN, node: hostname };
     }

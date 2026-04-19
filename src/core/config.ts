@@ -93,11 +93,17 @@ const RegistryConfigSchema = z.object({
   path: z.string().default('~/.alchemy/registry.db'),
 });
 
+const TunnelConfigSchema = z.object({
+  token: z.string().optional(),
+}).optional();
+
 const AlchemyConfigSchema = z.object({
   executor: ExecutorConfigSchema,
+  workstation: WorkstationSSHExecutorConfigSchema.optional(),
   notifiers: z.array(NotifierConfigSchema),
   analyzers: z.array(AnalyzerConfigSchema).optional(),
   webhook: WebhookConfigSchema,
+  tunnel: TunnelConfigSchema,
   dashboard: DashboardConfigSchema.optional(),
   registry: RegistryConfigSchema,
 });

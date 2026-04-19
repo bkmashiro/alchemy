@@ -358,6 +358,19 @@
     code { font-family: 'SF Mono', 'Consolas', monospace; font-size: 0.85em; color: var(--accent); }
     .dim { color: var(--text-secondary); }
     .no-wrap { white-space: nowrap; }
+
+    /* Cancel button in table */
+    .cancel-btn {
+      background: none;
+      border: 1px solid transparent;
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .cancel-btn:hover { border-color: var(--red); color: var(--red); background: rgba(248,81,73,0.08); }
   </style>
 </head>
 <body>
@@ -400,10 +413,11 @@
             <th>Node</th>
             <th>Elapsed</th>
             <th>Created</th>
+            <th></th>
           </tr>
         </thead>
         <tbody id="jobs-tbody">
-          <tr><td colspan="8" class="empty-state">Loading jobs...</td></tr>
+          <tr><td colspan="9" class="empty-state">Loading jobs...</td></tr>
         </tbody>
       </table>
     </section>

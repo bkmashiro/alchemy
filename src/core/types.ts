@@ -408,9 +408,11 @@ export interface RegistryConfig {
 
 export interface AlchemyConfig {
   executor: ExecutorConfig;
+  workstation?: WorkstationSSHExecutorConfig;
   notifiers: NotifierConfig[];
   analyzers?: AnalyzerConfig[];
   webhook: WebhookConfig;
+  tunnel?: { token?: string };
   dashboard?: DashboardConfig;
   registry: RegistryConfig;
 }

@@ -152,9 +152,11 @@ function renderChains(chains, jobs) {
 
 // ─── Job Table Rendering ─────────────────────────────────────
 
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timeout', 'cancelled']);
+
 function renderJobs(jobs) {
   if (jobs.length === 0) {
-    jobsTbody.innerHTML = `<tr><td colspan="8" class="empty-state">No jobs found.</td></tr>`;
+    jobsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">No jobs found.</td></tr>`;
     return;
   }
 
@@ -166,6 +168,10 @@ function renderJobs(jobs) {
     const node   = job.node ?? '—';
     const elapsed = formatElapsed(job.elapsed);
     const created = formatTime(job.createdAt);
+    const canCancel = !TERMINAL_STATUSES.has(job.status);
+    const cancelCell = canCancel
+      ? `<button class="cancel-btn" onclick="cancelJob(event, '${job.id}', '${name}')">✕ Cancel</button>`
+      : '';
     return `
       <tr class="${isSelected}" data-id="${job.id}" onclick="openLogs('${job.id}', '${name}', '${job.status}')">
         <td><code>${shortId(job.id)}</code></td>
@@ -176,9 +182,23 @@ function renderJobs(jobs) {
         <td class="dim">${node}</td>
         <td class="no-wrap">${elapsed}</td>
         <td class="dim no-wrap">${created}</td>
+        <td>${cancelCell}</td>
       </tr>
     `;
   }).join('');
+}
+
+async function cancelJob(event, jobId, jobName) {
+  event.stopPropagation(); // Don't open log panel
+  if (!confirm(`Cancel job "${jobName}"?`)) return;
+  try {
+    const result = await api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    if (result.ok) {
+      poll(); // Refresh immediately
+    }
+  } catch (err) {
+    alert(`Cancel failed: ${err.message}`);
+  }
 }
 
 // ─── Log Viewer ──────────────────────────────────────────────

@@ -10,7 +10,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp -r src/dashboard/public dist/dashboard/public",
     "dev": "tsx watch src/cli/index.ts",
     "lint": "eslint src/",
     "test": "vitest run",

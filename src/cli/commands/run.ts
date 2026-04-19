@@ -5,8 +5,12 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { loadConfig } from '../../core/config.js';
 import { JobRegistry } from '../../core/registry.js';
-import type { JobSpec } from '../../core/types.js';
+import { PluginManager } from '../../core/plugin-manager.js';
+import { JobStatus, type JobSpec } from '../../core/types.js';
 import { shortId } from '../formatting.js';
+
+// Ensure executors are registered
+import '../../executors/index.js';
 
 export function registerRunCommand(program: Command): void {
   program
@@ -21,6 +25,8 @@ export function registerRunCommand(program: Command): void {
     .option('--cpus <n>', 'CPUs per task')
     .option('-e, --env <K=V>', 'Extra env var (repeatable)', collectEnvVars, [])
     .option('--tag <tag>', 'Tag (repeatable)', collectTags, [])
+    .option('--ws', 'Submit to a workstation instead of SLURM')
+    .option('--host <host>', 'Target workstation host (default: auto)')
     .option('--dry-run', 'Print job spec without submitting')
     .option('--watch', 'Poll status until done')
     .action(
@@ -36,6 +42,8 @@ export function registerRunCommand(program: Command): void {
           cpus?: string;
           env?: string[];
           tag?: string[];
+          ws?: boolean;
+          host?: string;
           dryRun?: boolean;
           watch?: boolean;
         },
@@ -96,15 +104,48 @@ export function registerRunCommand(program: Command): void {
         console.log(`Memory:    ${spec.resources.mem}`);
         console.log(`GPUs:      ${spec.resources.gpus}`);
 
+        // Determine executor type and config
+        const useWorkstation = opts.ws === true;
+        const executorType = useWorkstation ? 'workstation_ssh' : config.executor.type;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const executorConfig = useWorkstation ? (config as any).workstation : config.executor;
+
+        if (useWorkstation && !executorConfig) {
+          console.error(chalk.red('No workstation config found in alchemy.config.yaml'));
+          process.exit(1);
+        }
+
+        // Set target host in metadata for workstation executor
+        if (useWorkstation && opts.host) {
+          spec.metadata = { ...spec.metadata, targetHost: opts.host };
+        }
+
         const registry = new JobRegistry(config.registry.path);
         try {
-          const jobId = registry.createJob(spec, 'slurm_ssh');
-          console.log(chalk.green(`\nJob created: ${chalk.bold(shortId(jobId))}`));
-          console.log(`Full ID: ${jobId}`);
-          console.log(`\nRun 'alchemy status ${shortId(jobId)}' to check status.`);
+          const jobId = registry.createJob(spec, executorType);
+
+          // Actually submit to executor
+          const pm = PluginManager.instance;
+          const executor = pm.createExecutor(executorType, executorConfig);
+          await executor.initialize();
+
+          try {
+            const result = await executor.submit(jobId, spec);
+            registry.updateJob(jobId, {
+              slurmJobId: result.externalJobId,
+              status: JobStatus.SUBMITTED,
+              logPath: result.logPath,
+            });
+            console.log(chalk.green(`\nJob submitted: ${chalk.bold(shortId(jobId))}`));
+            console.log(`External ID: ${result.externalJobId}`);
+            console.log(`Log: ${result.logPath}`);
+            console.log(`\nRun 'alchemy status ${shortId(jobId)}' to check status.`);
+          } finally {
+            await executor.destroy();
+          }
         } catch (err) {
-          console.log(chalk.yellow('[Stub mode] Registry not fully initialized.'));
-          console.log(`Would run: ${command}`);
+          console.error(chalk.red(`Submit failed: ${String(err)}`));
+          process.exit(1);
         } finally {
           registry.close();
         }

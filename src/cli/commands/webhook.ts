@@ -51,7 +51,12 @@ export function registerWebhookCommand(program: Command): void {
         const { AlchemyOrchestrator } = await import('../../core/orchestrator.js');
 
         const orchestrator = new AlchemyOrchestrator(config);
-        await orchestrator.initialize();
+        try {
+          await orchestrator.initialize();
+        } catch (initErr) {
+          console.log(chalk.yellow(`Executor init deferred: ${String(initErr)}`));
+          console.log(chalk.dim('Webhook server will still receive events; executor features unavailable until connection succeeds.'));
+        }
 
         if (webhookPublicUrl) {
           const intervalMs = 5 * 60 * 1000;

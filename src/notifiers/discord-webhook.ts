@@ -122,9 +122,10 @@ export class DiscordWebhookNotifier extends BaseNotifier {
       timestamp: new Date().toISOString(),
     };
 
+    const extId = job.slurmJobId ?? '';
     const payload: DiscordPayload = {
       content: this.config.mentionId
-        ? `${this.config.mentionId} Job started`
+        ? `${this.config.mentionId} 🚀 [${job.spec.name}] ${extId} started on ${job.node ?? '?'}`
         : undefined,
       embeds: [embed],
     };
@@ -160,7 +161,7 @@ export class DiscordWebhookNotifier extends BaseNotifier {
 
     const payload: DiscordPayload = {
       content: this.config.mentionId
-        ? `${this.config.mentionId} Job completed successfully`
+        ? `${this.config.mentionId} ✅ [${job.spec.name}] completed on ${job.node ?? '?'} (${formatElapsed(job.elapsed)})`
         : undefined,
       embeds: [embed],
     };
@@ -200,7 +201,7 @@ export class DiscordWebhookNotifier extends BaseNotifier {
 
     const payload: DiscordPayload = {
       content: this.config.mentionId
-        ? `${this.config.mentionId} Job FAILED`
+        ? `${this.config.mentionId} ❌ [${job.spec.name}] FAILED on ${job.node ?? '?'} (exit ${job.exitCode ?? '?'})`
         : undefined,
       embeds: [embed],
     };

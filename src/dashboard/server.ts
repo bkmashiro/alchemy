@@ -8,6 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerApiRoutes } from './api.js';
 import { JobRegistry } from '../core/registry.js';
+import type { BaseExecutor } from '../executors/base.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,6 +23,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export async function createDashboardServer(
   registry: JobRegistry,
   port: number,
+  executors?: BaseExecutor | Map<string, BaseExecutor>,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -37,8 +39,13 @@ export async function createDashboardServer(
     prefix: '/',
   });
 
-  // Register API routes
-  registerApiRoutes(app, registry);
+  // Register API routes — normalize to Map
+  const executorMap: Map<string, BaseExecutor> = executors instanceof Map
+    ? executors
+    : executors
+      ? new Map([[executors.type, executors]])
+      : new Map();
+  registerApiRoutes(app, registry, executorMap);
 
   // Fallback: serve index.html for any unmatched route (SPA support)
   app.setNotFoundHandler((_request, reply) => {

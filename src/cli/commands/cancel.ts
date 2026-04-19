@@ -9,6 +9,8 @@ import { loadConfig } from '../../core/config.js';
 import { JobRegistry } from '../../core/registry.js';
 import { JobStatus, ChainStatus } from '../../core/types.js';
 import { shortId, colorStatus } from '../formatting.js';
+import { PluginManager } from '../../core/plugin-manager.js';
+import type { BaseExecutor } from '../../executors/base.js';
 
 export function registerCancelCommand(program: Command): void {
   program
@@ -27,6 +29,19 @@ export function registerCancelCommand(program: Command): void {
         }
 
         const registry = new JobRegistry(config.registry.path);
+
+        // Try to initialize executor for actual cancellation
+        let executor: BaseExecutor | null = null;
+        try {
+          // Import executors so they self-register
+          await import('../../executors/index.js');
+          const pm = PluginManager.instance;
+          executor = pm.createExecutor(config.executor.type, config.executor);
+          await executor.initialize();
+        } catch (execErr) {
+          console.log(chalk.yellow(`Note: Could not connect to executor (${String(execErr)})`));
+          console.log(chalk.yellow('Will update registry status only; run scancel/kill manually if needed.'));
+        }
 
         try {
           // Resolve ID — try job first, then chain
@@ -61,15 +76,20 @@ export function registerCancelCommand(program: Command): void {
               }
             }
 
-            // In production, this calls executor.cancel(job.slurmJobId!)
-            // then registry.updateJob(job.id, { status: JobStatus.CANCELLED })
-            console.log(
-              chalk.yellow(
-                `[Stub] Would cancel job ${chalk.bold(job.spec.name)} (slurmId: ${job.slurmJobId ?? 'N/A'})`,
-              ),
-            );
-            console.log(chalk.yellow('Note: Actual cancellation requires an SSH executor connection.'));
-            console.log(chalk.yellow('Run scancel manually if needed, or restart with an active executor.'));
+            if (executor && job.slurmJobId) {
+              try {
+                await executor.cancel(job.slurmJobId);
+                console.log(chalk.green(`Cancelled job ${chalk.bold(job.spec.name)} (slurmId: ${job.slurmJobId})`));
+              } catch (cancelErr) {
+                console.log(chalk.yellow(`Executor cancel failed: ${String(cancelErr)}`));
+                console.log(chalk.yellow('Updating registry status anyway.'));
+              }
+            } else if (!executor) {
+              console.log(chalk.yellow(`No executor connection — updating registry status only.`));
+              console.log(chalk.yellow(`Run scancel ${job.slurmJobId ?? 'N/A'} manually on the cluster.`));
+            }
+            registry.updateJob(job.id, { status: JobStatus.CANCELLED });
+            console.log(chalk.green(`Registry updated: job ${shortId(job.id)} marked as cancelled`));
             return;
           } else if (matchingJobs.length > 1) {
             console.error(chalk.red(`Ambiguous ID: ${id} matches multiple jobs`));
@@ -115,12 +135,25 @@ export function registerCancelCommand(program: Command): void {
               }
             }
 
-            console.log(
-              chalk.yellow(
-                `[Stub] Would cancel chain ${chalk.bold(chain.spec.name)} and ${cancellable.length} active jobs.`,
-              ),
-            );
-            console.log(chalk.yellow('Note: Actual cancellation requires an SSH executor connection.'));
+            let cancelledCount = 0;
+            for (const job of cancellable) {
+              if (executor && job.slurmJobId) {
+                try {
+                  await executor.cancel(job.slurmJobId);
+                  cancelledCount++;
+                } catch (cancelErr) {
+                  console.log(chalk.yellow(`  Failed to cancel job ${shortId(job.id)} (${job.slurmJobId}): ${String(cancelErr)}`));
+                }
+              }
+              registry.updateJob(job.id, { status: JobStatus.CANCELLED });
+            }
+            registry.updateChain(chain.id, { status: ChainStatus.CANCELLED });
+            if (executor) {
+              console.log(chalk.green(`Chain cancelled: ${cancelledCount}/${cancellable.length} jobs cancelled via executor`));
+            } else {
+              console.log(chalk.yellow(`No executor connection — registry updated, run scancel manually.`));
+            }
+            console.log(chalk.green(`Registry updated: chain ${shortId(chain.id)} marked as cancelled`));
             return;
           } else if (matchingChains.length > 1) {
             console.error(chalk.red(`Ambiguous ID: ${id} matches multiple chains`));
@@ -131,6 +164,9 @@ export function registerCancelCommand(program: Command): void {
           process.exit(1);
         } finally {
           registry.close();
+          if (executor) {
+            await executor.destroy().catch(() => {});
+          }
         }
       },
     );
