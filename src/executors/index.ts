@@ -4,3 +4,4 @@
 export * from './base.js';
 export * from './slurm-ssh.js';
 export * from './local.js';
+export * from './workstation-ssh.js';

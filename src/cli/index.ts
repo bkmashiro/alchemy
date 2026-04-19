@@ -19,6 +19,7 @@ import { registerLsCommand } from './commands/ls.js';
 import { registerDashboardCommand } from './commands/dashboard.js';
 import { registerWebhookCommand } from './commands/webhook.js';
 import { registerMcpCommand } from './commands/mcp.js';
+import { registerGpuCommand } from './commands/gpu.js';
 
 const program = new Command()
   .name('alchemy')
@@ -34,5 +35,6 @@ registerLsCommand(program);
 registerDashboardCommand(program);
 registerWebhookCommand(program);
 registerMcpCommand(program);
+registerGpuCommand(program);
 
 program.parse();

@@ -120,6 +120,16 @@ export interface JobSpec {
    * Default: false
    */
   disableWebhook?: boolean;
+  /**
+   * Optional checkpoint file to check before submission.
+   * If the file exists on the remote machine, the job is skipped.
+   */
+  checkpoint?: {
+    /** Path to checkpoint file (e.g., "runs/${name}/final.pt") */
+    path: string;
+    /** If true, skip submission when checkpoint exists. Default: true */
+    skipIfExists: boolean;
+  };
 }
 
 // ─── Job Record ──────────────────────────────────────────────
@@ -294,7 +304,42 @@ export interface LocalExecutorConfig {
   logDir: string;
 }
 
-export type ExecutorConfig = SlurmSSHExecutorConfig | LocalExecutorConfig;
+// ─── Workstation Host ───────────────────────────────────────
+
+export interface WorkstationHost {
+  /** Short name (e.g., "gpu19") */
+  name: string;
+  /** Full hostname (e.g., "gpu19.doc.ic.ac.uk") */
+  hostname: string;
+  /** GPU model name (e.g., "2080Ti", "4080") */
+  gpuType: string;
+  /** Number of GPUs on this host */
+  gpuCount: number;
+  /** VRAM per GPU in GB */
+  vram: number;
+}
+
+export interface WorkstationSSHExecutorConfig {
+  type: 'workstation_ssh';
+  /** Jump host (SSH config name or user@host). E.g., 'shell2' */
+  jumpHost: string;
+  /** List of workstation hosts reachable from jump host */
+  hosts: WorkstationHost[];
+  /** SSH username */
+  user: string;
+  /** Project root on the workstations */
+  projectRoot: string;
+  /** Conda/venv bin path to prepend to PATH */
+  condaEnvBin: string;
+  /** Extra env vars to set in every job */
+  defaultEnv?: Record<string, string>;
+  /** SSH private key path (optional, uses ssh-agent by default) */
+  privateKeyPath?: string;
+  /** SSH connection timeout in ms. Default: 10000 */
+  connectTimeout?: number;
+}
+
+export type ExecutorConfig = SlurmSSHExecutorConfig | LocalExecutorConfig | WorkstationSSHExecutorConfig;
 
 // ─── Notifier Config ─────────────────────────────────────────
 

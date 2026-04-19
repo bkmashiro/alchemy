@@ -27,9 +27,30 @@ const LocalExecutorConfigSchema = z.object({
   logDir: z.string(),
 });
 
+const WorkstationHostSchema = z.object({
+  name: z.string(),
+  hostname: z.string(),
+  gpuType: z.string(),
+  gpuCount: z.number().int().positive(),
+  vram: z.number().positive(),
+});
+
+const WorkstationSSHExecutorConfigSchema = z.object({
+  type: z.literal('workstation_ssh'),
+  jumpHost: z.string(),
+  hosts: z.array(WorkstationHostSchema).min(1),
+  user: z.string(),
+  projectRoot: z.string(),
+  condaEnvBin: z.string(),
+  defaultEnv: z.record(z.string()).optional(),
+  privateKeyPath: z.string().optional(),
+  connectTimeout: z.number().optional(),
+});
+
 const ExecutorConfigSchema = z.discriminatedUnion('type', [
   SlurmSSHExecutorConfigSchema,
   LocalExecutorConfigSchema,
+  WorkstationSSHExecutorConfigSchema,
 ]);
 
 const DiscordWebhookNotifierConfigSchema = z.object({
