@@ -130,6 +130,21 @@ export interface JobSpec {
     /** If true, skip submission when checkpoint exists. Default: true */
     skipIfExists: boolean;
   };
+  /**
+   * VRAM requirement in GB for workstation auto-selection.
+   * If unset, any host with >2 GB free is acceptable.
+   */
+  vram?: number;
+  /**
+   * Path to progress.json written by the training script.
+   * If set, Alchemy polls this file to show step/ETA info.
+   * Format: { step, total, elapsed_seconds, eta_seconds }
+   */
+  progressFile?: string;
+  /**
+   * Job priority for the task pool (higher = dispatched sooner). Default: 50.
+   */
+  priority?: number;
 }
 
 // ─── Job Record ──────────────────────────────────────────────
@@ -471,6 +486,40 @@ export interface AlchemyJobFile {
   job?: JobSpec;
   /** Chain definition (mutually exclusive with job) */
   chain?: ChainSpec;
+}
+
+// ─── GPU Status ──────────────────────────────────────────────
+
+export interface GpuStatus {
+  host: string;
+  gpuType: string;
+  totalVram: number;
+  usedVram: number;
+  freeVram: number;
+  gpuUtil: number;
+  hasForeignProcess: boolean;
+  available: boolean;
+  reachable: boolean;
+}
+
+// ─── Progress Info ───────────────────────────────────────────
+
+export interface ProgressInfo {
+  step: number;
+  total: number;
+  elapsedSeconds: number;
+  etaSeconds: number;
+  percent: number;
+}
+
+// ─── Pool Entry ──────────────────────────────────────────────
+
+export interface PoolEntry {
+  jobId: AlchemyJobId;
+  spec: JobSpec;
+  priority: number;
+  executorType: string;
+  addedAt: ISOTimestamp;
 }
 
 // ─── API Response Types (Dashboard) ──────────────────────────

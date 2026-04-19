@@ -7,6 +7,8 @@ import { z } from 'zod';
 import { JobRegistry } from '../core/registry.js';
 import { JobStatus, ChainStatus } from '../core/types.js';
 import type { BaseExecutor } from '../executors/base.js';
+import type { Scheduler } from '../core/scheduler.js';
+import type { WorkstationSSHExecutor } from '../executors/workstation-ssh.js';
 
 // ─── Query param schemas ──────────────────────────────────────
 
@@ -37,8 +39,14 @@ function getExecutorForJob(executors: Map<string, BaseExecutor>, executorType: s
 /**
  * Register all dashboard API routes.
  * @param executors Map of executor type → executor instance.
+ * @param scheduler Optional task pool scheduler.
  */
-export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry, executors: Map<string, BaseExecutor>): void {
+export function registerApiRoutes(
+  app: FastifyInstance,
+  registry: JobRegistry,
+  executors: Map<string, BaseExecutor>,
+  scheduler?: Scheduler,
+): void {
   // ─── GET /api/summary ──────────────────────────────────────
 
   app.get('/api/summary', async (_req: FastifyRequest, reply: FastifyReply) => {
@@ -291,6 +299,143 @@ export function registerApiRoutes(app: FastifyInstance, registry: JobRegistry, e
       return reply
         .status(500)
         .send({ error: `Failed to submit: ${String(err)}` });
+    }
+  });
+
+  // ─── GET /api/gpu-status ───────────────────────────────────
+
+  app.get('/api/gpu-status', async (_req: FastifyRequest, reply: FastifyReply) => {
+    const wsExecutor = executors.get('workstation_ssh') as WorkstationSSHExecutor | undefined;
+    if (!wsExecutor) {
+      return reply.send({ hosts: [], note: 'No workstation executor configured' });
+    }
+    try {
+      const hosts = await wsExecutor.getGpuStatus();
+      return reply.send({ hosts });
+    } catch (err) {
+      return reply.status(500).send({ error: `Failed to query GPU status: ${String(err)}` });
+    }
+  });
+
+  // ─── GET /api/pool ─────────────────────────────────────────
+
+  app.get('/api/pool', async (_req: FastifyRequest, reply: FastifyReply) => {
+    if (!scheduler) {
+      return reply.send({ entries: [] });
+    }
+    const entries = scheduler.listPool();
+    return reply.send({ entries });
+  });
+
+  // ─── POST /api/pool/add ────────────────────────────────────
+
+  app.post('/api/pool/add', async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!scheduler) {
+      return reply.status(503).send({ error: 'Scheduler not available' });
+    }
+    const body = req.body as { spec?: unknown; executorType?: string; priority?: number };
+    if (!body?.spec) {
+      return reply.status(400).send({ error: 'Missing spec' });
+    }
+    try {
+      const entry = scheduler.addToPool(
+        body.spec as Parameters<typeof scheduler.addToPool>[0],
+        body.executorType ?? 'slurm_ssh',
+        body.priority,
+      );
+      return reply.send({ entry });
+    } catch (err) {
+      return reply.status(500).send({ error: String(err) });
+    }
+  });
+
+  // ─── POST /api/pool/:id/priority ───────────────────────────
+
+  app.post('/api/pool/:id/priority', async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!scheduler) {
+      return reply.status(503).send({ error: 'Scheduler not available' });
+    }
+    const { id } = req.params as { id: string };
+    const body = req.body as { priority?: number };
+    if (body?.priority === undefined || typeof body.priority !== 'number') {
+      return reply.status(400).send({ error: 'Missing or invalid priority (must be a number)' });
+    }
+    try {
+      scheduler.setPriority(id, body.priority);
+      return reply.send({ ok: true });
+    } catch (err) {
+      return reply.status(404).send({ error: String(err) });
+    }
+  });
+
+  // ─── DELETE /api/pool/:id ──────────────────────────────────
+
+  app.delete('/api/pool/:id', async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!scheduler) {
+      return reply.status(503).send({ error: 'Scheduler not available' });
+    }
+    const { id } = req.params as { id: string };
+    try {
+      scheduler.removeFromPool(id);
+      return reply.send({ ok: true });
+    } catch (err) {
+      return reply.status(404).send({ error: String(err) });
+    }
+  });
+
+  // ─── POST /api/pool/dispatch ───────────────────────────────
+
+  app.post('/api/pool/dispatch', async (_req: FastifyRequest, reply: FastifyReply) => {
+    if (!scheduler) {
+      return reply.status(503).send({ error: 'Scheduler not available' });
+    }
+    try {
+      await scheduler.tryDispatch();
+      return reply.send({ ok: true });
+    } catch (err) {
+      return reply.status(500).send({ error: String(err) });
+    }
+  });
+
+  // ─── GET /api/jobs/:id/progress ────────────────────────────
+
+  app.get('/api/jobs/:id/progress', async (req: FastifyRequest, reply: FastifyReply) => {
+    const { id } = req.params as { id: string };
+    try {
+      const job = registry.getJob(id);
+
+      if (!job.spec.progressFile) {
+        return reply.send({ progress: null, note: 'No progressFile configured for this job' });
+      }
+
+      if (!job.slurmJobId?.startsWith('ws:')) {
+        return reply.send({ progress: null, note: 'Progress polling only supported for workstation jobs' });
+      }
+
+      const wsExecutor = executors.get('workstation_ssh') as WorkstationSSHExecutor | undefined;
+      if (!wsExecutor) {
+        return reply.send({ progress: null, note: 'No workstation executor' });
+      }
+
+      const parts = job.slurmJobId.split(':');
+      const hostname = parts[1] ?? '';
+      const raw = await wsExecutor.fetchProgress(hostname, job.spec.progressFile);
+      if (!raw) {
+        return reply.send({ progress: null });
+      }
+
+      const percent = raw.total > 0 ? Math.round((raw.step / raw.total) * 1000) / 10 : 0;
+      return reply.send({
+        progress: {
+          step: raw.step,
+          total: raw.total,
+          elapsedSeconds: raw.elapsed_seconds,
+          etaSeconds: raw.eta_seconds,
+          percent,
+        },
+      });
+    } catch {
+      return reply.status(404).send({ error: `Job not found: ${id}` });
     }
   });
 }

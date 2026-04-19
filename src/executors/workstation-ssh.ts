@@ -9,6 +9,7 @@ import {
   JobStatus,
   WorkstationSSHExecutorConfig,
   WorkstationHost,
+  GpuStatus,
 } from '../core/types.js';
 import { SSHConnectionError, SubmissionError } from '../core/errors.js';
 import { createLogger } from '../core/logger.js';
@@ -19,6 +20,8 @@ export interface GPUQueryResult {
   memoryUsedMB: number;
   memoryTotalMB: number;
   memoryFreeMB: number;
+  gpuUtil: number;
+  hasForeignProcess: boolean;
   available: boolean;
 }
 
@@ -27,13 +30,32 @@ export interface GPUQueryResult {
  * Jobs are tracked by PID files on the remote machine.
  * External job ID format: "ws:<hostname>:<pid>"
  */
+// Reconnect backoff: start 1s, double each attempt, cap at 60s
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 60000;
+const RECONNECT_MAX_ATTEMPTS = 8;
+
+// Keepalive interval — ping jump host every 30s to detect stale connections early
+const KEEPALIVE_INTERVAL_MS = 30000;
+
+function backoffDelay(attempt: number): number {
+  return Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export class WorkstationSSHExecutor extends BaseExecutor {
   readonly type = 'workstation_ssh';
   private jumpSSH: NodeSSH;
+  private jumpConnected = false;
+  private jumpReconnecting = false;
   private hostConnections: Map<string, NodeSSH> = new Map();
   private config: WorkstationSSHExecutorConfig;
   private logger: pino.Logger;
   private webhookPublicUrl: string;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: WorkstationSSHExecutorConfig, webhookPublicUrl = '') {
     super();
@@ -48,6 +70,25 @@ export class WorkstationSSHExecutor extends BaseExecutor {
   }
 
   async initialize(): Promise<void> {
+    await this._connectJump();
+    this._startKeepalive();
+  }
+
+  /**
+   * Connect (or reconnect) the jump host SSH connection.
+   * Disposes stale host connections on reconnect since tunnels are invalidated.
+   */
+  private async _connectJump(): Promise<void> {
+    // Dispose existing jump connection and all tunneled host connections
+    try { this.jumpSSH.dispose(); } catch { /* ignore */ }
+    for (const [name, ssh] of this.hostConnections) {
+      try { ssh.dispose(); } catch { /* ignore */ }
+      this.logger.debug({ host: name }, 'Dropped tunneled host connection (jump reconnect)');
+    }
+    this.hostConnections.clear();
+    this.jumpConnected = false;
+
+    this.jumpSSH = new NodeSSH();
     await this.jumpSSH.connect({
       host: this.config.jumpHost,
       username: this.config.user,
@@ -55,7 +96,87 @@ export class WorkstationSSHExecutor extends BaseExecutor {
       privateKeyPath: this.config.privateKeyPath,
       readyTimeout: this.config.connectTimeout ?? 10000,
     });
+    this.jumpConnected = true;
     this.logger.info({ host: this.config.jumpHost }, 'Connected to jump host');
+  }
+
+  /**
+   * Ensure the jump host connection is alive, reconnecting with exponential
+   * backoff if it has dropped. Concurrent callers wait for the same attempt.
+   */
+  private async _ensureJumpConnected(): Promise<void> {
+    // Fast path: already connected
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (this.jumpConnected && (this.jumpSSH as any).connection !== null) return;
+
+    if (this.jumpReconnecting) {
+      // Wait until the ongoing reconnect resolves (poll cheaply)
+      while (this.jumpReconnecting) await sleep(200);
+      return;
+    }
+
+    this.jumpReconnecting = true;
+    try {
+      for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
+        const delay = backoffDelay(attempt);
+        if (attempt > 0) {
+          this.logger.info(
+            { attempt, delayMs: delay, host: this.config.jumpHost },
+            'Waiting before jump host reconnect attempt',
+          );
+          await sleep(delay);
+        }
+        try {
+          this.logger.info(
+            { attempt: attempt + 1, max: RECONNECT_MAX_ATTEMPTS, host: this.config.jumpHost },
+            'Reconnecting to jump host',
+          );
+          await this._connectJump();
+          this.logger.info({ host: this.config.jumpHost }, 'Jump host reconnected successfully');
+          return;
+        } catch (err) {
+          this.logger.warn(
+            { attempt: attempt + 1, err, host: this.config.jumpHost },
+            'Jump host reconnect attempt failed',
+          );
+        }
+      }
+      throw new SSHConnectionError(
+        `Failed to reconnect to jump host after ${RECONNECT_MAX_ATTEMPTS} attempts`,
+        this.config.jumpHost,
+      );
+    } finally {
+      this.jumpReconnecting = false;
+    }
+  }
+
+  /**
+   * Periodic keepalive: runs a no-op on the jump host to detect stale
+   * connections before the next real command hits them.
+   */
+  private _startKeepalive(): void {
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = setInterval(async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const conn = (this.jumpSSH as any).connection;
+        if (!conn) {
+          this.logger.warn({ host: this.config.jumpHost }, 'Keepalive detected null jump connection, triggering reconnect');
+          await this._ensureJumpConnected();
+          return;
+        }
+        await this.jumpSSH.execCommand('true');
+      } catch (err) {
+        this.logger.warn({ err, host: this.config.jumpHost }, 'Keepalive ping failed, marking jump connection stale');
+        this.jumpConnected = false;
+        // Proactively reconnect so next real command doesn't pay the full delay
+        this._ensureJumpConnected().catch(e =>
+          this.logger.error({ err: e }, 'Background jump reconnect failed'),
+        );
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+    // Don't block process exit on this timer
+    if (this.keepaliveTimer.unref) this.keepaliveTimer.unref();
   }
 
   /**
@@ -73,9 +194,20 @@ export class WorkstationSSHExecutor extends BaseExecutor {
       throw new SSHConnectionError(`Unknown host: ${hostname}`, hostname);
     }
 
+    // Guarantee the jump host is up before trying to tunnel through it
+    await this._ensureJumpConnected();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const jumpConn = (this.jumpSSH as any).connection;
+    if (!jumpConn) {
+      throw new SSHConnectionError(
+        `Jump host connection is null after reconnect attempt`,
+        this.config.jumpHost,
+      );
+    }
+
     const stream = await new Promise<NodeJS.ReadWriteStream>((resolve, reject) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (this.jumpSSH as any).connection.forwardOut(
+      jumpConn.forwardOut(
         '127.0.0.1',
         0,
         host.hostname,
@@ -111,12 +243,14 @@ export class WorkstationSSHExecutor extends BaseExecutor {
 
   /**
    * Execute a command on a specific workstation host.
+   * On failure, drops the cached host connection and the jump connection (if
+   * it looks stale) then retries with full exponential-backoff reconnect.
    */
   private async execOnHost(
     hostname: string,
     command: string,
   ): Promise<{ stdout: string; stderr: string }> {
-    try {
+    const attempt = async () => {
       const ssh = await this.getHostConnection(hostname);
       const result = await ssh.execCommand(command, {
         cwd: this.config.projectRoot,
@@ -128,16 +262,24 @@ export class WorkstationSSHExecutor extends BaseExecutor {
         );
       }
       return { stdout: result.stdout, stderr: result.stderr };
+    };
+
+    try {
+      return await attempt();
     } catch (err) {
-      // Drop cached connection and retry once
+      // Drop cached host connection; if the error looks like a jump-level
+      // failure (null connection / forwardOut), also mark jump as stale.
       this.hostConnections.delete(hostname);
-      this.logger.warn({ err, host: hostname }, 'SSH command failed, attempting reconnect');
+      const msg = String((err as Error)?.message ?? err);
+      if (msg.includes('forwardOut') || msg.includes('null') || msg.includes('No response from server')) {
+        this.logger.warn({ err, host: hostname }, 'Jump host connection appears stale, will reconnect');
+        this.jumpConnected = false;
+      } else {
+        this.logger.warn({ err, host: hostname }, 'SSH command failed, attempting reconnect');
+      }
+
       try {
-        const ssh = await this.getHostConnection(hostname);
-        const result = await ssh.execCommand(command, {
-          cwd: this.config.projectRoot,
-        });
-        return { stdout: result.stdout, stderr: result.stderr };
+        return await attempt();
       } catch (reconnectErr) {
         throw new SSHConnectionError(
           `SSH command failed after reconnect: ${String(reconnectErr)}`,
@@ -149,9 +291,10 @@ export class WorkstationSSHExecutor extends BaseExecutor {
 
   /**
    * Resolve a host name or "auto" to a concrete WorkstationHost.
-   * "auto" picks the host with the most free VRAM.
+   * "auto" picks the best available host: enough free VRAM, lowest GPU utilization,
+   * no heavy foreign GPU processes.
    */
-  private async resolveHost(targetHost?: string): Promise<WorkstationHost> {
+  private async resolveHost(targetHost?: string, vramRequiredGB?: number): Promise<WorkstationHost> {
     if (targetHost && targetHost !== 'auto') {
       const host = this.config.hosts.find(h => h.name === targetHost || h.hostname === targetHost);
       if (!host) {
@@ -160,14 +303,35 @@ export class WorkstationSSHExecutor extends BaseExecutor {
       return host;
     }
 
-    // Auto-select: pick host with most free VRAM
     const results = await this.listAvailableHosts();
-    const available = results.filter(r => r.available);
-    if (available.length === 0) {
-      throw new SubmissionError('No workstation hosts with available GPU memory', '');
+    let candidates = results.filter(r => r.available && !r.hasForeignProcess);
+
+    if (vramRequiredGB !== undefined) {
+      const requiredMB = vramRequiredGB * 1024;
+      candidates = candidates.filter(r => r.memoryFreeMB >= requiredMB);
     }
-    available.sort((a, b) => b.memoryFreeMB - a.memoryFreeMB);
-    return available[0]!.host;
+
+    if (candidates.length === 0) {
+      // Fallback: ignore foreign process check, just need free VRAM
+      const fallback = results.filter(r => r.available);
+      if (vramRequiredGB !== undefined) {
+        const requiredMB = vramRequiredGB * 1024;
+        const withVram = fallback.filter(r => r.memoryFreeMB >= requiredMB);
+        if (withVram.length > 0) {
+          withVram.sort((a, b) => a.gpuUtil - b.gpuUtil);
+          return withVram[0]!.host;
+        }
+      }
+      if (fallback.length === 0) {
+        throw new SubmissionError('No workstation hosts with available GPU memory', '');
+      }
+      fallback.sort((a, b) => b.memoryFreeMB - a.memoryFreeMB);
+      return fallback[0]!.host;
+    }
+
+    // Sort by GPU utilization ascending (least loaded first)
+    candidates.sort((a, b) => a.gpuUtil - b.gpuUtil);
+    return candidates[0]!.host;
   }
 
   /**
@@ -250,7 +414,7 @@ ${spec.command}
   async submit(alchemyJobId: AlchemyJobId, spec: JobSpec): Promise<SubmitResult> {
     // Determine target host from spec metadata or auto-select
     const targetHostName = (spec.metadata?.['targetHost'] as string) ?? 'auto';
-    const host = await this.resolveHost(targetHostName);
+    const host = await this.resolveHost(targetHostName, spec.vram);
     const hostname = host.name;
 
     const logDir = `${this.config.projectRoot}/logs`;
@@ -373,20 +537,22 @@ ${spec.command}
 
   /**
    * Query GPU usage on a specific host via nvidia-smi.
+   * Returns memory and utilization per GPU.
    */
-  async queryGPU(hostname: string): Promise<{ usedMB: number; totalMB: number }[]> {
+  async queryGPU(hostname: string): Promise<{ usedMB: number; totalMB: number; util: number }[]> {
     const { stdout } = await this.execOnHost(
       hostname,
-      'nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits',
+      'nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits',
     );
 
-    const gpus: { usedMB: number; totalMB: number }[] = [];
+    const gpus: { usedMB: number; totalMB: number; util: number }[] = [];
     for (const line of stdout.trim().split('\n')) {
       const parts = line.split(',').map(s => s.trim());
       if (parts.length >= 2) {
         gpus.push({
           usedMB: parseInt(parts[0]!, 10),
           totalMB: parseInt(parts[1]!, 10),
+          util: parts[2] ? parseInt(parts[2], 10) : 0,
         });
       }
     }
@@ -394,26 +560,51 @@ ${spec.command}
   }
 
   /**
+   * Check whether any GPU process on the host belongs to another user.
+   * Uses nvidia-smi pmon to list PIDs, then maps them to usernames.
+   */
+  private async hasForeignGpuProcess(hostname: string): Promise<boolean> {
+    try {
+      // Get PIDs of GPU processes, then check their owner
+      const { stdout } = await this.execOnHost(
+        hostname,
+        `nvidia-smi pmon -c 1 -s m 2>/dev/null | awk 'NR>2 && $2~/^[0-9]+$/ {print $2}' | xargs -r ps -o user= -p 2>/dev/null | grep -v '^${this.config.user}$' | head -1`,
+      );
+      return stdout.trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Query all configured hosts concurrently and return availability info.
-   * Each host query has a 5s timeout to avoid blocking on unreachable machines.
+   * Each host query has a 8s timeout to avoid blocking on unreachable machines.
    */
   async listAvailableHosts(): Promise<GPUQueryResult[]> {
     const queryOne = async (host: WorkstationHost): Promise<GPUQueryResult> => {
       try {
-        const gpus = await Promise.race([
-          this.queryGPU(host.name),
+        const [gpus, foreignProcess] = await Promise.race([
+          Promise.all([
+            this.queryGPU(host.name),
+            this.hasForeignGpuProcess(host.name),
+          ]),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('GPU query timeout')), 5000),
+            setTimeout(() => reject(new Error('GPU query timeout')), 8000),
           ),
         ]);
         const totalUsed = gpus.reduce((sum, g) => sum + g.usedMB, 0);
         const totalMem = gpus.reduce((sum, g) => sum + g.totalMB, 0);
         const freeMB = totalMem - totalUsed;
+        const avgUtil = gpus.length > 0
+          ? gpus.reduce((sum, g) => sum + g.util, 0) / gpus.length
+          : 0;
         return {
           host,
           memoryUsedMB: totalUsed,
           memoryTotalMB: totalMem,
           memoryFreeMB: freeMB,
+          gpuUtil: avgUtil,
+          hasForeignProcess: foreignProcess,
           available: freeMB > 2048,
         };
       } catch (err) {
@@ -423,6 +614,8 @@ ${spec.command}
           memoryUsedMB: 0,
           memoryTotalMB: 0,
           memoryFreeMB: 0,
+          gpuUtil: 0,
+          hasForeignProcess: false,
           available: false,
         };
       }
@@ -431,13 +624,50 @@ ${spec.command}
     return Promise.all(this.config.hosts.map(queryOne));
   }
 
+  /**
+   * Return GpuStatus objects for all hosts (for dashboard API).
+   */
+  async getGpuStatus(): Promise<GpuStatus[]> {
+    const results = await this.listAvailableHosts();
+    return results.map(r => ({
+      host: r.host.name,
+      gpuType: r.host.gpuType,
+      totalVram: r.host.vram,
+      usedVram: Math.round(r.memoryUsedMB / 1024 * 10) / 10,
+      freeVram: Math.round(r.memoryFreeMB / 1024 * 10) / 10,
+      gpuUtil: Math.round(r.gpuUtil),
+      hasForeignProcess: r.hasForeignProcess,
+      available: r.available,
+      reachable: r.memoryTotalMB > 0,
+    }));
+  }
+
+  /**
+   * Fetch progress.json from a specific host and path.
+   * Returns null if file does not exist or cannot be parsed.
+   */
+  async fetchProgress(hostname: string, progressFile: string): Promise<{ step: number; total: number; elapsed_seconds: number; eta_seconds: number } | null> {
+    try {
+      const { stdout } = await this.execOnHost(hostname, `cat '${progressFile}' 2>/dev/null`);
+      if (!stdout.trim()) return null;
+      return JSON.parse(stdout) as { step: number; total: number; elapsed_seconds: number; eta_seconds: number };
+    } catch {
+      return null;
+    }
+  }
+
   async destroy(): Promise<void> {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     for (const [name, ssh] of this.hostConnections) {
       ssh.dispose();
       this.logger.debug({ host: name }, 'Host connection closed');
     }
     this.hostConnections.clear();
     this.jumpSSH.dispose();
+    this.jumpConnected = false;
     this.logger.info('All SSH connections closed');
   }
 }

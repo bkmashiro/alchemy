@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { registerApiRoutes } from './api.js';
 import { JobRegistry } from '../core/registry.js';
 import type { BaseExecutor } from '../executors/base.js';
+import type { Scheduler } from '../core/scheduler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -24,6 +25,7 @@ export async function createDashboardServer(
   registry: JobRegistry,
   port: number,
   executors?: BaseExecutor | Map<string, BaseExecutor>,
+  scheduler?: Scheduler,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -45,7 +47,7 @@ export async function createDashboardServer(
     : executors
       ? new Map([[executors.type, executors]])
       : new Map();
-  registerApiRoutes(app, registry, executorMap);
+  registerApiRoutes(app, registry, executorMap, scheduler);
 
   // Fallback: serve index.html for any unmatched route (SPA support)
   app.setNotFoundHandler((_request, reply) => {

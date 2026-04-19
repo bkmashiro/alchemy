@@ -13,6 +13,7 @@ let selectedJobId = null;
 let logPollTimer = null;
 let allJobsCache = [];
 let allChainsCache = [];
+let gpuPollTimer = null;
 
 // ─── DOM References ──────────────────────────────────────────
 
@@ -37,6 +38,9 @@ const cancelModalBtn = document.getElementById('cancel-modal-btn');
 const openSubmitModal = document.getElementById('open-submit-modal');
 const submitResult   = document.getElementById('submit-result');
 const filterBtns     = document.querySelectorAll('.filter-btn');
+const gpuGrid        = document.getElementById('gpu-grid');
+const gpuRefreshBtn  = document.getElementById('gpu-refresh-btn');
+const poolTbody      = document.getElementById('pool-tbody');
 
 // ─── API Helpers ─────────────────────────────────────────────
 
@@ -291,6 +295,97 @@ async function handleSubmit() {
   }
 }
 
+// ─── GPU Status Rendering ─────────────────────────────────────
+
+function renderGpuStatus(hosts) {
+  if (!gpuGrid) return;
+  if (!hosts || hosts.length === 0) {
+    gpuGrid.innerHTML = '<div class="empty-state">No workstation hosts configured.</div>';
+    return;
+  }
+
+  gpuGrid.innerHTML = hosts.map(h => {
+    const pct = h.totalVram > 0 ? Math.round((h.usedVram / h.totalVram) * 100) : 0;
+    const cardClass = !h.reachable ? 'unreachable' : h.hasForeignProcess ? 'foreign' : h.available ? 'available' : 'busy';
+    const statusLabel = !h.reachable ? 'unreachable' : h.hasForeignProcess ? 'foreign proc' : h.available ? 'available' : 'busy';
+    return `
+      <div class="gpu-card ${cardClass}">
+        <div class="gpu-card-name">${escapeHtml(h.host)}</div>
+        <div class="gpu-card-type">${escapeHtml(h.gpuType)}</div>
+        <div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:${pct}%"></div></div>
+        <div class="gpu-card-meta">
+          <span>${h.usedVram}/${h.totalVram} GB · ${h.gpuUtil}% util</span>
+          <span>${statusLabel}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function pollGpu() {
+  try {
+    const data = await api('/api/gpu-status');
+    renderGpuStatus(data.hosts || []);
+  } catch {
+    if (gpuGrid) gpuGrid.innerHTML = '<div class="empty-state">GPU status unavailable</div>';
+  }
+}
+
+// ─── Pool Rendering ───────────────────────────────────────────
+
+function renderPool(entries) {
+  if (!poolTbody) return;
+  if (!entries || entries.length === 0) {
+    poolTbody.innerHTML = '<tr><td colspan="5" class="empty-state">Pool is empty</td></tr>';
+    return;
+  }
+
+  poolTbody.innerHTML = entries.map(e => `
+    <tr>
+      <td>${e.priority}</td>
+      <td>${escapeHtml(e.spec?.name ?? '—')}</td>
+      <td class="dim">${escapeHtml(e.executorType)}</td>
+      <td class="dim">${formatTime(e.addedAt)}</td>
+      <td>
+        <button class="prio-btn" onclick="bumpPriority('${e.id}', ${e.priority}, 10)">▲</button>
+        <button class="prio-btn" onclick="bumpPriority('${e.id}', ${e.priority}, -10)">▼</button>
+        <button class="cancel-btn" onclick="removeFromPool('${e.id}')">✕</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+async function bumpPriority(poolId, current, delta) {
+  try {
+    await api(`/api/pool/${poolId}/priority`, {
+      method: 'POST',
+      body: JSON.stringify({ priority: current + delta }),
+    });
+    pollPool();
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  }
+}
+
+async function removeFromPool(poolId) {
+  if (!confirm('Remove from pool?')) return;
+  try {
+    await api(`/api/pool/${poolId}`, { method: 'DELETE' });
+    pollPool();
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  }
+}
+
+async function pollPool() {
+  try {
+    const data = await api('/api/pool');
+    renderPool(data.entries || []);
+  } catch {
+    // pool not available — hide section
+  }
+}
+
 // ─── Main Poll ───────────────────────────────────────────────
 
 async function poll() {
@@ -308,6 +403,7 @@ async function poll() {
     renderSummary(summaryData);
     renderJobs(allJobsCache);
     renderChains(allChainsCache, allJobsCache);
+    pollPool();
 
     connectionStatus.textContent = '● live';
     connectionStatus.className = 'ok';
@@ -362,7 +458,17 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// ─── GPU refresh button ───────────────────────────────────────
+
+if (gpuRefreshBtn) {
+  gpuRefreshBtn.addEventListener('click', pollGpu);
+}
+
 // ─── Init ────────────────────────────────────────────────────
 
 poll();
 setInterval(poll, POLL_INTERVAL);
+
+// GPU status polls less frequently (every 30s) since SSH queries are expensive
+pollGpu();
+gpuPollTimer = setInterval(pollGpu, 30000);

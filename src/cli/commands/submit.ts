@@ -9,8 +9,13 @@ import { z } from 'zod';
 import chalk from 'chalk';
 import { loadConfig } from '../../core/config.js';
 import { JobRegistry } from '../../core/registry.js';
+import { PluginManager } from '../../core/plugin-manager.js';
 import type { AlchemyJobFile, JobSpec, ChainSpec } from '../../core/types.js';
-import { shortId, formatJobDetail } from '../formatting.js';
+import { JobStatus } from '../../core/types.js';
+import { shortId } from '../formatting.js';
+
+// Ensure executors are registered
+import '../../executors/index.js';
 
 // ─── Zod schema for AlchemyJobFile ───────────────────────────
 
@@ -66,8 +71,9 @@ export function registerSubmitCommand(program: Command): void {
     .description('Submit a job or chain from a YAML file')
     .option('--config <path>', 'Path to alchemy config file')
     .option('--dry-run', 'Validate YAML and print details without submitting')
+    .option('--ws', 'Submit to a workstation instead of SLURM')
     .option('--watch', 'Poll status every 5s after submitting until done')
-    .action(async (yamlFile: string, opts: { config?: string; dryRun?: boolean; watch?: boolean }) => {
+    .action(async (yamlFile: string, opts: { config?: string; dryRun?: boolean; ws?: boolean; watch?: boolean }) => {
       const filePath = resolve(yamlFile);
       if (!existsSync(filePath)) {
         console.error(chalk.red(`Error: File not found: ${filePath}`));
@@ -125,11 +131,21 @@ export function registerSubmitCommand(program: Command): void {
         process.exit(1);
       }
 
+      const useWorkstation = opts.ws === true;
+      const executorType = useWorkstation ? 'workstation_ssh' : config.executor.type;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const executorConfig = useWorkstation ? (config as any).workstation : config.executor;
+
+      if (useWorkstation && !executorConfig) {
+        console.error(chalk.red('No workstation config found in alchemy.config.yaml'));
+        process.exit(1);
+      }
+
       const registry = new JobRegistry(config.registry.path);
 
       try {
         if (jobFile.job) {
-          await submitSingleJob(jobFile.job as JobSpec, registry, opts.watch ?? false);
+          await submitSingleJob(jobFile.job as JobSpec, registry, executorType, executorConfig, opts.watch ?? false);
         } else if (jobFile.chain) {
           await submitChain(jobFile.chain as ChainSpec, registry);
         }
@@ -142,27 +158,34 @@ export function registerSubmitCommand(program: Command): void {
 async function submitSingleJob(
   spec: JobSpec,
   registry: JobRegistry,
+  executorType: string,
+  executorConfig: unknown,
   _watch: boolean,
 ): Promise<void> {
   console.log(chalk.cyan(`Submitting job: ${chalk.bold(spec.name)}`));
   console.log(`Command: ${spec.command}`);
   console.log(`Resources: partition=${spec.resources.partition} time=${spec.resources.time} mem=${spec.resources.mem} gpus=${spec.resources.gpus}`);
 
+  const jobId = registry.createJob(spec, executorType);
+
+  const pm = PluginManager.instance;
+  const executor = pm.createExecutor(executorType, executorConfig);
+  await executor.initialize();
+
   try {
-    const jobId = registry.createJob(spec, 'slurm_ssh');
-    console.log(chalk.green(`\nJob created successfully!`));
-    console.log(`Alchemy ID: ${chalk.bold(shortId(jobId))} (${jobId})`);
-    console.log(`\nNote: Full job submission requires an executor (SSH connection).`);
-    console.log(`Run 'alchemy status ${shortId(jobId)}' to check status.`);
-  } catch (err) {
-    // Registry stub will throw; show what would happen
-    console.log(chalk.yellow('\n[Stub mode] Registry not fully initialized.'));
-    console.log(`Would create job: ${spec.name}`);
-    console.log(`  partition: ${spec.resources.partition}`);
-    console.log(`  time: ${spec.resources.time}`);
-    console.log(`  mem: ${spec.resources.mem}`);
-    console.log(`  gpus: ${spec.resources.gpus}`);
-    console.log(`  command: ${spec.command}`);
+    const result = await executor.submit(jobId, spec);
+    registry.updateJob(jobId, {
+      slurmJobId: result.externalJobId,
+      status: JobStatus.SUBMITTED,
+      logPath: result.logPath,
+    });
+    console.log(chalk.green(`\nJob submitted!`));
+    console.log(`Alchemy ID:  ${chalk.bold(shortId(jobId))}`);
+    console.log(`External ID: ${result.externalJobId}`);
+    console.log(`Log:         ${result.logPath}`);
+    console.log(`\nRun 'alchemy status ${shortId(jobId)}' to check status.`);
+  } finally {
+    await executor.destroy();
   }
 }
 

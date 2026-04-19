@@ -20,6 +20,7 @@ import { registerDashboardCommand } from './commands/dashboard.js';
 import { registerWebhookCommand } from './commands/webhook.js';
 import { registerMcpCommand } from './commands/mcp.js';
 import { registerGpuCommand } from './commands/gpu.js';
+import { registerPoolCommand } from './commands/pool.js';
 
 const program = new Command()
   .name('alchemy')
@@ -36,5 +37,6 @@ registerDashboardCommand(program);
 registerWebhookCommand(program);
 registerMcpCommand(program);
 registerGpuCommand(program);
+registerPoolCommand(program);
 
 program.parse();
