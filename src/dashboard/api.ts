@@ -9,6 +9,7 @@ import { JobStatus, ChainStatus } from '../core/types.js';
 import type { BaseExecutor } from '../executors/base.js';
 import type { Scheduler } from '../core/scheduler.js';
 import type { WorkstationSSHExecutor } from '../executors/workstation-ssh.js';
+import type { SlurmSSHExecutor, SlurmClusterStatus } from '../executors/slurm-ssh.js';
 
 // ─── Query param schemas ──────────────────────────────────────
 
@@ -47,6 +48,12 @@ export function registerApiRoutes(
   executors: Map<string, BaseExecutor>,
   scheduler?: Scheduler,
 ): void {
+  // ─── GET /api/health ───────────────────────────────────────
+
+  app.get('/api/health', async (_req: FastifyRequest, reply: FastifyReply) => {
+    return reply.send({ status: 'ok', uptime: process.uptime() });
+  });
+
   // ─── GET /api/summary ──────────────────────────────────────
 
   app.get('/api/summary', async (_req: FastifyRequest, reply: FastifyReply) => {
@@ -122,6 +129,28 @@ export function registerApiRoutes(
     const { id } = req.params as { id: string };
     const queryParsed = LogsQuerySchema.safeParse(req.query);
     const tailLines = queryParsed.success ? (queryParsed.data.tail ?? 50) : 50;
+
+    // Handle untracked SLURM jobs (id = "slurm-<jobId>")
+    if (id.startsWith('slurm-')) {
+      const slurmJobId = id.replace('slurm-', '');
+      const slurmExecutor = executors.get('slurm_ssh');
+      if (!slurmExecutor) {
+        return reply.send({ logs: '(No SLURM executor available)' });
+      }
+      try {
+        // Try common log patterns
+        const logDir = '/vol/bitbucket/ys25/jema/logs';
+        const findCmd = `ls -t ${logDir}/*${slurmJobId}*.log ${logDir}/*${slurmJobId}*.out 2>/dev/null | head -1`;
+        const { stdout: logFile } = await (slurmExecutor as unknown as { execRemote(cmd: string): Promise<{ stdout: string; stderr: string }> }).execRemote(findCmd);
+        if (logFile.trim()) {
+          const logs = await slurmExecutor.fetchLogs(logFile.trim(), tailLines);
+          return reply.send({ logs: logs || '(Log file is empty)' });
+        }
+        return reply.send({ logs: `(No log file found for SLURM job ${slurmJobId})` });
+      } catch (err) {
+        return reply.send({ logs: `(Failed to fetch SLURM logs: ${String(err)})` });
+      }
+    }
 
     try {
       const job = registry.getJob(id);
@@ -284,9 +313,11 @@ export function registerApiRoutes(
 
     try {
       if (jobFile.job) {
+        const jobData = jobFile.job as Record<string, unknown>;
+        const executorType = (typeof jobData.executorType === 'string' ? jobData.executorType : 'slurm_ssh');
         const id = registry.createJob(
-          jobFile.job as Parameters<typeof registry.createJob>[0],
-          'slurm_ssh',
+          jobData as unknown as Parameters<typeof registry.createJob>[0],
+          executorType,
         );
         return reply.send({ id, type: 'job' });
       } else {
@@ -314,6 +345,27 @@ export function registerApiRoutes(
       return reply.send({ hosts });
     } catch (err) {
       return reply.status(500).send({ error: `Failed to query GPU status: ${String(err)}` });
+    }
+  });
+
+  // ─── GET /api/cluster-status ────────────────────────────────
+
+  let clusterCache: SlurmClusterStatus | null = null;
+  const CLUSTER_CACHE_TTL = 5 * 60_000; // 5 min
+
+  app.get('/api/cluster-status', async (_req: FastifyRequest, reply: FastifyReply) => {
+    const slurmExecutor = executors.get('slurm_ssh') as SlurmSSHExecutor | undefined;
+    if (!slurmExecutor) {
+      return reply.send({ nodes: [], jobs: [], note: 'No SLURM executor configured' });
+    }
+    try {
+      if (clusterCache && Date.now() - clusterCache.queriedAt < CLUSTER_CACHE_TTL) {
+        return reply.send(clusterCache);
+      }
+      clusterCache = await slurmExecutor.getClusterStatus();
+      return reply.send(clusterCache);
+    } catch (err) {
+      return reply.status(500).send({ error: `Failed to query cluster: ${String(err)}` });
     }
   });
 
@@ -397,45 +449,194 @@ export function registerApiRoutes(
     }
   });
 
-  // ─── GET /api/jobs/:id/progress ────────────────────────────
+  // ─── POST /api/jobs/:id/migrate ─────────────────────────────
+  // Manual migrate: cancel current → resubmit to target (resumable jobs only)
 
-  app.get('/api/jobs/:id/progress', async (req: FastifyRequest, reply: FastifyReply) => {
+  app.post('/api/jobs/:id/migrate', async (req: FastifyRequest, reply: FastifyReply) => {
     const { id } = req.params as { id: string };
+    const body = req.body as { targetHost?: string };
+
     try {
       const job = registry.getJob(id);
 
-      if (!job.spec.progressFile) {
-        return reply.send({ progress: null, note: 'No progressFile configured for this job' });
+      if (!job.spec.resumable) {
+        return reply.status(400).send({ error: 'Job is not resumable — cannot migrate' });
       }
 
-      if (!job.slurmJobId?.startsWith('ws:')) {
-        return reply.send({ progress: null, note: 'Progress polling only supported for workstation jobs' });
+      if (job.status !== JobStatus.RUNNING && job.status !== JobStatus.SUBMITTED) {
+        return reply.status(400).send({ error: `Job must be running/submitted to migrate (current: ${job.status})` });
       }
 
-      const wsExecutor = executors.get('workstation_ssh') as WorkstationSSHExecutor | undefined;
-      if (!wsExecutor) {
-        return reply.send({ progress: null, note: 'No workstation executor' });
+      const executor = getExecutorForJob(executors, job.executorType);
+
+      // Cancel current job
+      if (executor && job.slurmJobId) {
+        try { await executor.cancel(job.slurmJobId); } catch { /* best effort */ }
+      }
+      registry.updateJob(id, { status: JobStatus.CANCELLED });
+
+      // Create new job with same spec + resume flag
+      const newSpec = { ...job.spec };
+      if (newSpec.resumeCheckpoint && !newSpec.command.includes('--resume')) {
+        newSpec.command += ' --resume';
+      }
+      if (body?.targetHost && job.executorType === 'workstation_ssh') {
+        newSpec.metadata = { ...newSpec.metadata, targetHost: body.targetHost };
       }
 
-      const parts = job.slurmJobId.split(':');
-      const hostname = parts[1] ?? '';
-      const raw = await wsExecutor.fetchProgress(hostname, job.spec.progressFile);
-      if (!raw) {
-        return reply.send({ progress: null });
+      const newJobId = registry.createJob(newSpec, job.executorType);
+
+      if (executor) {
+        try {
+          const result = await executor.submit(newJobId, newSpec);
+          registry.updateJob(newJobId, {
+            slurmJobId: result.externalJobId,
+            status: JobStatus.SUBMITTED,
+            logPath: result.logPath,
+          });
+          return reply.send({ ok: true, cancelled: id, newJobId, submitted: true, targetHost: body?.targetHost ?? 'auto' });
+        } catch (err) {
+          return reply.send({ ok: true, cancelled: id, newJobId, submitted: false, error: String(err) });
+        }
       }
 
-      const percent = raw.total > 0 ? Math.round((raw.step / raw.total) * 1000) / 10 : 0;
-      return reply.send({
-        progress: {
-          step: raw.step,
-          total: raw.total,
-          elapsedSeconds: raw.elapsed_seconds,
-          etaSeconds: raw.eta_seconds,
-          percent,
-        },
-      });
+      return reply.send({ ok: true, cancelled: id, newJobId, submitted: false, note: 'No executor — new job created but not submitted' });
     } catch {
       return reply.status(404).send({ error: `Job not found: ${id}` });
     }
   });
+
+  // ─── GET /api/jobs/:id/progress ────────────────────────────
+
+  // Cache: jobId → { data, ts }
+  const progressCache = new Map<string, { data: unknown; ts: number }>();
+  const PROGRESS_CACHE_TTL = 30_000; // 30s
+
+  /**
+   * Parse tqdm-style progress from log text.
+   * Matches: "Training:   5%|..| 22726/500000 [33:56<13:22:01, 9.92it/s]"
+   */
+  function parseTqdmFromLog(logText: string): { step: number; total: number; percent: number; eta: string } | null {
+    // Get last tqdm line (may have \r)
+    const lines = logText.replace(/\r/g, '\n').split('\n').filter(l => l.includes('%|'));
+    if (lines.length === 0) return null;
+    const line = lines[lines.length - 1]!;
+    const m = line.match(/(\d+)%\|.*?\|\s*([\d,]+)\/([\d,]+)\s*\[([^\]<]+)<([^\],]+)/);
+    if (!m) return null;
+    return {
+      percent: parseInt(m[1]!),
+      step: parseInt(m[2]!.replace(/,/g, '')),
+      total: parseInt(m[3]!.replace(/,/g, '')),
+      eta: m[5]!.trim(),
+    };
+  }
+
+  app.get('/api/jobs/:id/progress', async (req: FastifyRequest, reply: FastifyReply) => {
+    const { id } = req.params as { id: string };
+    try {
+      // Check cache
+      const cached = progressCache.get(id);
+      if (cached && Date.now() - cached.ts < PROGRESS_CACHE_TTL) {
+        return reply.send(cached.data);
+      }
+
+      const job = registry.getJob(id);
+      if (job.status !== JobStatus.RUNNING) {
+        return reply.send({ progress: null });
+      }
+
+      // Strategy 1: progressFile (if configured, workstation only)
+      if (job.spec.progressFile && job.slurmJobId?.startsWith('ws:')) {
+        const wsExecutor = executors.get('workstation_ssh') as WorkstationSSHExecutor | undefined;
+        if (wsExecutor) {
+          const hostname = job.slurmJobId.split(':')[1] ?? '';
+          const raw = await wsExecutor.fetchProgress(hostname, job.spec.progressFile);
+          if (raw) {
+            const result = {
+              progress: {
+                step: raw.step,
+                total: raw.total,
+                percent: raw.total > 0 ? Math.round((raw.step / raw.total) * 1000) / 10 : 0,
+                eta: raw.eta_seconds > 0 ? formatSeconds(raw.eta_seconds) : null,
+              },
+            };
+            progressCache.set(id, { data: result, ts: Date.now() });
+            return reply.send(result);
+          }
+        }
+      }
+
+      // Strategy 2: parse tqdm from log tail
+      const executor = getExecutorForJob(executors, job.executorType);
+      if (executor && job.logPath) {
+        try {
+          let logText: string;
+          if (job.slurmJobId?.startsWith('ws:') && 'fetchLogsFromHost' in executor) {
+            const hostname = job.slurmJobId.split(':')[1] ?? '';
+            logText = await (executor as { fetchLogsFromHost(h: string, p: string, n?: number): Promise<string> }).fetchLogsFromHost(hostname, job.logPath, 5);
+          } else {
+            logText = await executor.fetchLogs(job.logPath, 5);
+          }
+          const parsed = parseTqdmFromLog(logText);
+          if (parsed) {
+            const result = { progress: parsed };
+            progressCache.set(id, { data: result, ts: Date.now() });
+            return reply.send(result);
+          }
+        } catch { /* ignore log fetch failures */ }
+      }
+
+      const noProgress = { progress: null };
+      progressCache.set(id, { data: noProgress, ts: Date.now() });
+      return reply.send(noProgress);
+    } catch {
+      return reply.status(404).send({ error: `Job not found: ${id}` });
+    }
+  });
+
+  // ─── GET /api/jobs/running/progress ────────────────────────
+  // Batch endpoint: returns progress for all running jobs
+
+  app.get('/api/progress', async (_req: FastifyRequest, reply: FastifyReply) => {
+    const { jobs } = registry.listJobs({ status: JobStatus.RUNNING, limit: 50 });
+    const results: Record<string, unknown> = {};
+
+    await Promise.allSettled(
+      jobs.map(async (job) => {
+        // Check cache
+        const cached = progressCache.get(job.id);
+        if (cached && Date.now() - cached.ts < PROGRESS_CACHE_TTL) {
+          results[job.id] = cached.data;
+          return;
+        }
+
+        // Parse from log tail
+        const executor = getExecutorForJob(executors, job.executorType);
+        if (!executor || !job.logPath) return;
+
+        try {
+          let logText: string;
+          if (job.slurmJobId?.startsWith('ws:') && 'fetchLogsFromHost' in executor) {
+            const hostname = job.slurmJobId.split(':')[1] ?? '';
+            logText = await (executor as { fetchLogsFromHost(h: string, p: string, n?: number): Promise<string> }).fetchLogsFromHost(hostname, job.logPath, 5);
+          } else {
+            logText = await executor.fetchLogs(job.logPath, 5);
+          }
+          const parsed = parseTqdmFromLog(logText);
+          const data = parsed ? { progress: parsed } : { progress: null };
+          progressCache.set(job.id, { data, ts: Date.now() });
+          results[job.id] = data;
+        } catch { /* skip */ }
+      }),
+    );
+
+    return reply.send(results);
+  });
+}
+
+function formatSeconds(s: number): string {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h${m}m`;
+  return `${m}m`;
 }

@@ -7,9 +7,10 @@ import { loadConfig } from '../../core/config.js';
 import { JobRegistry } from '../../core/registry.js';
 import { createDashboardServer } from '../../dashboard/server.js';
 import { PluginManager } from '../../core/plugin-manager.js';
-import { JobStatus } from '../../core/types.js';
+import { JobStatus, type JobRecord } from '../../core/types.js';
 import type { BaseExecutor } from '../../executors/base.js';
 import type { BaseNotifier } from '../../notifiers/base.js';
+import { createScheduler, type Scheduler } from '../../core/scheduler.js';
 
 export function registerDashboardCommand(program: Command): void {
   program
@@ -35,6 +36,7 @@ export function registerDashboardCommand(program: Command): void {
       // Initialize all configured executors
       const executors: Map<string, BaseExecutor> = new Map();
       const notifiers: BaseNotifier[] = [];
+      let scheduler: Scheduler | undefined;
       let pollTimer: NodeJS.Timeout | undefined;
 
       try {
@@ -64,6 +66,19 @@ export function registerDashboardCommand(program: Command): void {
           }
         }
 
+        // Set webhook public URL on all executors so sbatch scripts get absolute URLs
+        const webhookPublicUrl = config.webhook?.publicUrl;
+        if (webhookPublicUrl) {
+          for (const exec of executors.values()) {
+            if ('setWebhookPublicUrl' in exec) {
+              (exec as unknown as { setWebhookPublicUrl(u: string): void }).setWebhookPublicUrl(webhookPublicUrl);
+            }
+          }
+          console.log(chalk.green(`Webhook URL: ${webhookPublicUrl}`));
+        } else {
+          console.log(chalk.yellow('No webhook.publicUrl configured — sbatch notifications disabled.'));
+        }
+
         // Initialize notifiers
         for (const notifierConfig of config.notifiers) {
           try {
@@ -76,14 +91,29 @@ export function registerDashboardCommand(program: Command): void {
           }
         }
 
+        // Create scheduler for auto-dispatch
+        scheduler = createScheduler(config.registry.path, registry, executors);
+
         if (executors.size > 0) {
           console.log(chalk.green(`${executors.size} executor(s), ${notifiers.length} notifier(s) — full mode.`));
 
           // Background status polling every 30s
+          // Track when jobs first entered UNKNOWN state
+          const unknownSince = new Map<string, number>();
+          const UNKNOWN_TIMEOUT_MS = 5 * 60_000; // 5 min → mark as failed
+          // Track jobs that have already been notified as "started" to avoid duplicates on restart
+          const notifiedStarted = new Set<string>();
+
+          // Pre-populate: jobs already RUNNING at startup don't need "started" notification
+          {
+            const { jobs: existingRunning } = registry.listJobs({ status: JobStatus.RUNNING, limit: 500 });
+            for (const j of existingRunning) notifiedStarted.add(j.id);
+          }
+
           const pollJobs = async () => {
             try {
               const { jobs } = registry.listJobs({
-                status: [JobStatus.PENDING, JobStatus.SUBMITTED, JobStatus.RUNNING],
+                status: [JobStatus.PENDING, JobStatus.SUBMITTED, JobStatus.RUNNING, JobStatus.UNKNOWN],
                 limit: 200,
               });
               for (const job of jobs) {
@@ -93,6 +123,20 @@ export function registerDashboardCommand(program: Command): void {
                 try {
                   const result = await exec.status(job.slurmJobId);
                   if (result.status === job.status) continue;
+
+                  // Handle UNKNOWN: track timeout, don't immediately update to UNKNOWN
+                  if (result.status === JobStatus.UNKNOWN) {
+                    if (!unknownSince.has(job.id)) {
+                      unknownSince.set(job.id, Date.now());
+                    }
+                    const elapsed = Date.now() - unknownSince.get(job.id)!;
+                    if (elapsed < UNKNOWN_TIMEOUT_MS) continue; // wait longer
+                    // Timed out — mark as failed
+                    result.status = JobStatus.FAILED;
+                    unknownSince.delete(job.id);
+                  } else {
+                    unknownSince.delete(job.id);
+                  }
 
                   registry.updateJob(job.id, {
                     status: result.status,
@@ -106,7 +150,8 @@ export function registerDashboardCommand(program: Command): void {
                   // Send notifications on status changes
                   for (const notifier of notifiers) {
                     try {
-                      if (result.status === JobStatus.RUNNING) {
+                      if (result.status === JobStatus.RUNNING && !notifiedStarted.has(job.id)) {
+                        notifiedStarted.add(job.id);
                         await notifier.notifyJobStarted(updatedJob);
                       } else if (result.status === JobStatus.COMPLETED) {
                         await notifier.notifyJobCompleted(updatedJob);
@@ -125,6 +170,17 @@ export function registerDashboardCommand(program: Command): void {
                       }
                     } catch {
                       // skip notifier errors
+                    }
+                  }
+
+                  // Auto-dispatch: when a job finishes, try to dispatch next from pool
+                  if (
+                    result.status === JobStatus.COMPLETED ||
+                    result.status === JobStatus.FAILED ||
+                    result.status === JobStatus.TIMEOUT
+                  ) {
+                    if (scheduler) {
+                      scheduler.tryDispatch().catch(() => {});
                     }
                   }
                 } catch {
@@ -146,7 +202,7 @@ export function registerDashboardCommand(program: Command): void {
       console.log(chalk.cyan(`Starting Alchemy Dashboard on port ${port}...`));
 
       try {
-        await createDashboardServer(registry, port, executors);
+        await createDashboardServer(registry, port, executors, scheduler);
         console.log(chalk.green(`Dashboard running at: http://localhost:${port}`));
         console.log(chalk.dim('Press Ctrl+C to stop.'));
 
@@ -170,6 +226,20 @@ export function registerDashboardCommand(program: Command): void {
         process.on('SIGTERM', () => {
           cleanup();
           process.exit(0);
+        });
+
+        // Prevent silent crashes — log and exit so wrapper can restart
+        process.on('uncaughtException', (err) => {
+          console.error(chalk.red(`Uncaught exception: ${String(err)}`));
+          console.error(err.stack);
+          cleanup();
+          process.exit(1);
+        });
+
+        process.on('unhandledRejection', (reason) => {
+          console.error(chalk.red(`Unhandled rejection: ${String(reason)}`));
+          if (reason instanceof Error) console.error(reason.stack);
+          // Don't exit — log and continue; most rejections are non-fatal SSH errors
         });
 
         await new Promise<void>(() => {});
