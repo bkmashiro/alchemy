@@ -38,6 +38,12 @@ const RECONNECT_MAX_ATTEMPTS = 8;
 // Keepalive interval — ping jump host every 30s to detect stale connections early
 const KEEPALIVE_INTERVAL_MS = 30000;
 
+// GPU status cache — tiered TTL per host
+const GPU_TTL_ACTIVE_MS  = 3  * 60_000;  // hosts with running jobs: 3 min
+const GPU_TTL_IDLE_MS    = 10 * 60_000;  // cold hosts (no tasks): 10 min
+const GPU_TTL_FULL_MS    = 10 * 60_000;  // saturated hosts (util>90%): 10 min
+const GPU_TTL_STALE_MS   = 10 * 60_000;  // force refresh threshold for initial load
+
 function backoffDelay(attempt: number): number {
   return Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
 }
@@ -56,6 +62,10 @@ export class WorkstationSSHExecutor extends BaseExecutor {
   private logger: pino.Logger;
   private webhookPublicUrl: string;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** Per-host GPU status cache: hostname → { status, queriedAt } */
+  private gpuCache: Map<string, { status: GpuStatus; queriedAt: number }> = new Map();
+  /** Hosts with running alchemy jobs — updated by status() calls */
+  private activeHosts: Set<string> = new Set();
 
   constructor(config: WorkstationSSHExecutorConfig, webhookPublicUrl = '') {
     super();
@@ -492,10 +502,15 @@ ${spec.command}
       const nowTs = parseInt(lines[2] ?? '', 10);
       const elapsed = (!isNaN(startTs) && !isNaN(nowTs)) ? nowTs - startTs : undefined;
 
+      // Track active hosts for tiered cache TTL
       if (state === 'RUNNING') {
+        this.activeHosts.add(hostname);
+        // Piggyback: refresh GPU cache for active host in background
+        this.updateHostGpuCache(hostname).catch(() => {});
         return { status: JobStatus.RUNNING, node: hostname, elapsed };
       }
 
+      this.activeHosts.delete(hostname);
       return { status: JobStatus.COMPLETED, node: hostname, elapsed };
     } catch {
       return { status: JobStatus.UNKNOWN, node: hostname };
@@ -518,7 +533,7 @@ ${spec.command}
     // For now, try to find the log on any connected host
     for (const host of this.config.hosts) {
       try {
-        const { stdout } = await this.execOnHost(host.name, `tail -n ${tailLines} '${logPath}' 2>/dev/null`);
+        const { stdout } = await this.execOnHost(host.name, `tail -c 200000 '${logPath}' 2>/dev/null | tr '\\r' '\\n' | tail -n ${tailLines}`);
         if (stdout) return stdout;
       } catch {
         continue;
@@ -531,7 +546,10 @@ ${spec.command}
    * Fetch logs for a specific host (used when we know the host from externalJobId).
    */
   async fetchLogsFromHost(hostname: string, logPath: string, tailLines = 50): Promise<string> {
-    const { stdout } = await this.execOnHost(hostname, `tail -n ${tailLines} '${logPath}' 2>/dev/null`);
+    const { stdout } = await this.execOnHost(
+      hostname,
+      `tail -c 200000 '${logPath}' 2>/dev/null | tr '\\r' '\\n' | tail -n ${tailLines}`,
+    );
     return stdout;
   }
 
@@ -625,21 +643,116 @@ ${spec.command}
   }
 
   /**
+   * Determine the cache TTL for a host based on its state.
+   * Active (running alchemy jobs) → 3 min, saturated (>90% util) → 10 min, idle → 10 min.
+   */
+  private hostTTL(hostname: string): number {
+    if (this.activeHosts.has(hostname)) return GPU_TTL_ACTIVE_MS;
+    const cached = this.gpuCache.get(hostname);
+    if (cached && cached.status.gpuUtil > 90) return GPU_TTL_FULL_MS;
+    return GPU_TTL_IDLE_MS;
+  }
+
+  /**
    * Return GpuStatus objects for all hosts (for dashboard API).
+   *
+   * Strategy: always return cached data immediately. For hosts whose cache
+   * has expired, refresh them in the background. On first call (empty cache)
+   * or if any host is older than GPU_TTL_STALE_MS, do a synchronous refresh
+   * of those stale hosts only.
    */
   async getGpuStatus(): Promise<GpuStatus[]> {
-    const results = await this.listAvailableHosts();
-    return results.map(r => ({
-      host: r.host.name,
-      gpuType: r.host.gpuType,
-      totalVram: r.host.vram,
-      usedVram: Math.round(r.memoryUsedMB / 1024 * 10) / 10,
-      freeVram: Math.round(r.memoryFreeMB / 1024 * 10) / 10,
-      gpuUtil: Math.round(r.gpuUtil),
-      hasForeignProcess: r.hasForeignProcess,
-      available: r.available,
-      reachable: r.memoryTotalMB > 0,
-    }));
+    const now = Date.now();
+    const staleHosts: WorkstationHost[] = [];
+    const freshResults: GpuStatus[] = [];
+
+    for (const host of this.config.hosts) {
+      const cached = this.gpuCache.get(host.name);
+      if (cached) {
+        freshResults.push(cached.status);
+        const ttl = this.hostTTL(host.name);
+        if (now - cached.queriedAt > ttl) {
+          staleHosts.push(host);
+        }
+      } else {
+        // No cache at all — must query synchronously
+        staleHosts.push(host);
+      }
+    }
+
+    if (staleHosts.length > 0) {
+      // Query only stale hosts, in parallel
+      const refreshed = await Promise.all(staleHosts.map(h => this._queryOneHost(h)));
+      for (const entry of refreshed) {
+        this.gpuCache.set(entry.host, { status: entry, queriedAt: now });
+        const idx = freshResults.findIndex(s => s.host === entry.host);
+        if (idx >= 0) freshResults[idx] = entry;
+        else freshResults.push(entry);
+      }
+    }
+
+    return freshResults;
+  }
+
+  /**
+   * Query a single host and return a GpuStatus. On failure returns unreachable entry.
+   */
+  private async _queryOneHost(host: WorkstationHost): Promise<GpuStatus> {
+    try {
+      const [gpus, foreignProcess] = await Promise.race([
+        Promise.all([this.queryGPU(host.name), this.hasForeignGpuProcess(host.name)]),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('GPU query timeout')), 8000)),
+      ]);
+      const totalUsed = gpus.reduce((s, g) => s + g.usedMB, 0);
+      const totalMem = gpus.reduce((s, g) => s + g.totalMB, 0);
+      const freeMB = totalMem - totalUsed;
+      const avgUtil = gpus.length > 0 ? gpus.reduce((s, g) => s + g.util, 0) / gpus.length : 0;
+      return {
+        host: host.name,
+        gpuType: host.gpuType,
+        totalVram: host.vram,
+        usedVram: Math.round(totalUsed / 1024 * 10) / 10,
+        freeVram: Math.round(freeMB / 1024 * 10) / 10,
+        gpuUtil: Math.round(avgUtil),
+        hasForeignProcess: foreignProcess,
+        available: freeMB > 2048,
+        reachable: totalMem > 0,
+        lastQueried: Date.now(),
+      };
+    } catch (err) {
+      this.logger.warn({ host: host.name, err }, 'Failed to query GPU');
+      return {
+        host: host.name,
+        gpuType: host.gpuType,
+        totalVram: host.vram,
+        usedVram: 0, freeVram: 0, gpuUtil: 0,
+        hasForeignProcess: false, available: false, reachable: false,
+        lastQueried: Date.now(),
+      };
+    }
+  }
+
+  /**
+   * Piggyback: update a single host's cache entry after any SSH op on that host.
+   */
+  async updateHostGpuCache(hostname: string): Promise<void> {
+    const hostConfig = this.config.hosts.find(h => h.hostname === hostname || h.name === hostname);
+    if (!hostConfig) return;
+    try {
+      const entry = await this._queryOneHost(hostConfig);
+      this.gpuCache.set(hostConfig.name, { status: entry, queriedAt: Date.now() });
+    } catch {
+      // Non-critical
+    }
+  }
+
+  /**
+   * Force refresh all hosts' GPU cache. Called before dispatch to ensure fresh data.
+   */
+  async prefetchGpuStatus(): Promise<void> {
+    await Promise.allSettled(
+      this.config.hosts.map(h => this.updateHostGpuCache(h.name)),
+    );
   }
 
   /**

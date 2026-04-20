@@ -282,8 +282,9 @@ ${spec.command}
     // Write temp script to remote filesystem
     const tmpPath = `${this.config.projectRoot}/.alchemy_tmp_${Date.now()}_${alchemyJobId.slice(0, 8)}.sh`;
 
-    // Use printf to avoid heredoc issues with special characters
-    const writeCmd = `printf '%s' ${JSON.stringify(scriptContent)} > '${tmpPath}' && chmod +x '${tmpPath}'`;
+    // Use base64 to safely transfer script content (avoids shell escaping issues)
+    const b64 = Buffer.from(scriptContent, 'utf-8').toString('base64');
+    const writeCmd = `echo '${b64}' | base64 -d > '${tmpPath}' && chmod +x '${tmpPath}'`;
     await this.execRemote(writeCmd);
 
     try {
@@ -399,7 +400,10 @@ ${spec.command}
   }
 
   async fetchLogs(logPath: string, tailLines = 50): Promise<string> {
-    const { stdout } = await this.execRemote(`tail -n ${tailLines} '${logPath}' 2>/dev/null`);
+    // Use tail -c to cap bytes (avoid multi-MB tqdm \r lines), then take last N lines
+    const { stdout } = await this.execRemote(
+      `tail -c 200000 '${logPath}' 2>/dev/null | tr '\\r' '\\n' | tail -n ${tailLines}`,
+    );
     return stdout;
   }
 
@@ -451,6 +455,101 @@ ${spec.command}
       }
     }
   }
+  /**
+   * Query SLURM cluster GPU node availability via sinfo + squeue.
+   * Returns per-partition summary: total nodes, idle, allocated, and our running jobs.
+   */
+  async getClusterStatus(): Promise<SlurmClusterStatus> {
+    try {
+      const [sinfoRes, squeueRes, squeueAllRes] = await Promise.all([
+        this.execRemote("sinfo -N -o '%N %P %T %G' --noheader 2>/dev/null"),
+        this.execRemote(`squeue -u ${this.config.user} -o '%i %j %P %N %T %M' --noheader 2>/dev/null`),
+        this.execRemote("squeue -o '%i %u %N %T %b' --noheader -t RUNNING 2>/dev/null"),
+      ]);
+
+      const nodes: SlurmNodeInfo[] = [];
+      for (const line of sinfoRes.stdout.trim().split('\n')) {
+        if (!line.trim()) continue;
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 4) continue;
+        const [name, partition, state, gres] = parts;
+        const gpuMatch = gres!.match(/gpu(?::(\w+))?:(\d+)/);
+        const partClean = partition!.replace('*', '');
+        nodes.push({
+          name: name!,
+          partition: partClean,
+          state: state!,
+          gpuType: gpuMatch?.[1] ?? (partClean !== 'interactive' && partClean !== 'docker' && partClean !== 'training' ? partClean : 'gpu'),
+          gpuCount: gpuMatch ? parseInt(gpuMatch[2]!, 10) : 0,
+        });
+      }
+
+      const jobs: SlurmJobInfo[] = [];
+      for (const line of squeueRes.stdout.trim().split('\n')) {
+        if (!line.trim()) continue;
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 6) continue;
+        jobs.push({
+          jobId: parts[0]!,
+          name: parts[1]!,
+          partition: parts[2]!,
+          node: parts[3]!,
+          state: parts[4]!,
+          elapsed: parts[5]!,
+        });
+      }
+
+      // Parse all-user running jobs → GPU usage per node
+      const gpuUsedByNode: Record<string, number> = {};
+      const otherJobsByNode: Record<string, number> = {};
+      for (const line of squeueAllRes.stdout.trim().split('\n')) {
+        if (!line.trim()) continue;
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 5) continue;
+        const [, user, nodeList, state, tres] = parts;
+        if (state !== 'RUNNING') continue;
+        const gpuTres = tres?.match(/gpu(?::\w+)?:(\d+)/);
+        const gpuCount = gpuTres ? parseInt(gpuTres[1]!, 10) : 1;
+        const nodeNames = nodeList!.split(',');
+        for (const nd of nodeNames) {
+          gpuUsedByNode[nd] = (gpuUsedByNode[nd] ?? 0) + gpuCount;
+          if (user !== this.config.user) {
+            otherJobsByNode[nd] = (otherJobsByNode[nd] ?? 0) + 1;
+          }
+        }
+      }
+
+      return { nodes, jobs, gpuUsedByNode, otherJobsByNode, queriedAt: Date.now() };
+    } catch (err) {
+      this.logger.warn({ err }, 'Failed to query cluster status');
+      return { nodes: [], jobs: [], gpuUsedByNode: {}, otherJobsByNode: {}, queriedAt: Date.now() };
+    }
+  }
+}
+
+export interface SlurmNodeInfo {
+  name: string;
+  partition: string;
+  state: string;  // idle, mixed, allocated, down, drain, etc.
+  gpuType: string;
+  gpuCount: number;
+}
+
+export interface SlurmJobInfo {
+  jobId: string;
+  name: string;
+  partition: string;
+  node: string;
+  state: string;
+  elapsed: string;
+}
+
+export interface SlurmClusterStatus {
+  nodes: SlurmNodeInfo[];
+  jobs: SlurmJobInfo[];
+  gpuUsedByNode: Record<string, number>;
+  otherJobsByNode: Record<string, number>;
+  queriedAt: number;
 }
 
 // Self-registration

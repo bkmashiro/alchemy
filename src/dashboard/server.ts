@@ -35,10 +35,14 @@ export async function createDashboardServer(
 
   await app.register(fastifyCors, { origin: true });
 
-  // Serve static files from public/ directory
+  // Serve static files from public/ directory (no-cache for dev agility)
   await app.register(fastifyStatic, {
     root: join(__dirname, 'public'),
     prefix: '/',
+    cacheControl: false,
+    setHeaders(res) {
+      res.setHeader('Cache-Control', 'no-store');
+    },
   });
 
   // Register API routes — normalize to Map
@@ -54,7 +58,19 @@ export async function createDashboardServer(
     return reply.sendFile('index.html');
   });
 
-  await app.listen({ port, host: '0.0.0.0' });
+  // Retry listen to handle EADDRINUSE from slow process cleanup
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await app.listen({ port, host: '::' });
+      break;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE' && attempt < 4) {
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
+      throw err;
+    }
+  }
 
   return app;
 }

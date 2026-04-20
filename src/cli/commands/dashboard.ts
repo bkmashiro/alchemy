@@ -104,10 +104,14 @@ export function registerDashboardCommand(program: Command): void {
           // Track jobs that have already been notified as "started" to avoid duplicates on restart
           const notifiedStarted = new Set<string>();
 
-          // Pre-populate: jobs already RUNNING at startup don't need "started" notification
+          // Pre-populate: jobs already RUNNING/UNKNOWN at startup don't need "started" notification
+          // Also include UNKNOWN since they may have been RUNNING before a crash/restart
           {
-            const { jobs: existingRunning } = registry.listJobs({ status: JobStatus.RUNNING, limit: 500 });
-            for (const j of existingRunning) notifiedStarted.add(j.id);
+            const { jobs: existingActive } = registry.listJobs({
+              status: [JobStatus.RUNNING, JobStatus.UNKNOWN],
+              limit: 500,
+            });
+            for (const j of existingActive) notifiedStarted.add(j.id);
           }
 
           const pollJobs = async () => {

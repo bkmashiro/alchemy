@@ -145,6 +145,16 @@ export interface JobSpec {
    * Job priority for the task pool (higher = dispatched sooner). Default: 50.
    */
   priority?: number;
+  /**
+   * If true, the job supports --resume from checkpoint and can be migrated between nodes.
+   * When set, the command should accept a resume flag to continue from last checkpoint.
+   */
+  resumable?: boolean;
+  /**
+   * Path pattern for resume checkpoint (e.g., "runs/${name}/checkpoint.pt").
+   * Used by manual migrate to verify checkpoint exists before resubmitting.
+   */
+  resumeCheckpoint?: string;
 }
 
 // ─── Job Record ──────────────────────────────────────────────
@@ -500,6 +510,8 @@ export interface GpuStatus {
   hasForeignProcess: boolean;
   available: boolean;
   reachable: boolean;
+  /** Unix ms timestamp of last successful query */
+  lastQueried?: number;
 }
 
 // ─── Progress Info ───────────────────────────────────────────

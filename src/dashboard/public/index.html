@@ -390,9 +390,44 @@
     .gpu-card.unreachable { opacity: 0.5; }
     .gpu-card-name { font-weight: 700; font-size: 0.9rem; margin-bottom: 4px; }
     .gpu-card-type { font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 8px; }
-    .gpu-vram-bar { height: 5px; background: var(--bg-tertiary); border-radius: 3px; overflow: hidden; margin-bottom: 4px; }
-    .gpu-vram-fill { height: 100%; border-radius: 3px; background: var(--accent); }
-    .gpu-card-meta { font-size: 0.75rem; color: var(--text-secondary); display: flex; justify-content: space-between; }
+    .gpu-age { opacity: 0.5; font-size: 0.65rem; }
+    .gpu-bar-group { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+    .gpu-bar-label { font-size: 0.65rem; color: var(--text-secondary); width: 32px; flex-shrink: 0; }
+    .gpu-bar-value { font-size: 0.65rem; color: var(--text-secondary); width: 50px; text-align: right; flex-shrink: 0; }
+    .gpu-vram-bar { height: 5px; background: var(--bg-tertiary); border-radius: 3px; overflow: hidden; flex: 1; }
+    .gpu-vram-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width 0.3s; }
+    .gpu-card-meta { font-size: 0.75rem; color: var(--text-secondary); display: flex; justify-content: space-between; margin-top: 2px; }
+    .gpu-card-jobs { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 3px; }
+    .gpu-job-link { font-size: 0.7rem; color: var(--accent); background: rgba(88,166,255,0.1); padding: 1px 6px; border-radius: 3px; text-decoration: none; cursor: pointer; transition: background 0.15s; }
+    .gpu-job-link:hover { background: rgba(88,166,255,0.25); }
+    @keyframes flash { 0%,100% { background: transparent; } 50% { background: rgba(88,166,255,0.2); } }
+    tr.highlight-flash { animation: flash 0.5s ease 3; }
+    .gpu-card.stale { border-color: rgba(130,80,223,0.4); opacity: 0.55; }
+
+    #cluster-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .cluster-node {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.8rem;
+    }
+    .cluster-node.idle { border-color: rgba(63,185,80,0.4); }
+    .cluster-node.mixed { border-color: rgba(88,166,255,0.4); }
+    .cluster-node.allocated { border-color: rgba(248,81,73,0.3); }
+    .cluster-node.down, .cluster-node.drain { opacity: 0.4; }
+    .cluster-node.full { opacity: 0.45; }
+    .cluster-node-name { font-weight: 700; }
+    .cluster-node-meta { color: var(--text-secondary); font-size: 0.7rem; margin-top: 2px; }
+    .cluster-node-job { color: var(--accent); font-size: 0.7rem; margin-top: 2px; }
+    .cluster-node-others { color: var(--text-secondary); font-size: 0.65rem; margin-top: 1px; font-style: italic; }
+    .gpu-free { color: #3fb950; }
+    .gpu-none { color: #f85149; }
 
     /* Pool table */
     #pool-table {
@@ -438,6 +473,9 @@
     <section id="gpu-section">
       <h2>GPU Status <button id="gpu-refresh-btn" style="font-size:0.72rem;padding:2px 8px;margin-left:8px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;cursor:pointer;">↻ Refresh</button></h2>
       <div id="gpu-grid"><div class="empty-state">Querying hosts...</div></div>
+      <h3 style="margin-top:16px;font-size:0.9rem;color:var(--text-secondary);">SLURM Cluster</h3>
+      <div id="cluster-summary" style="font-size:0.75rem;color:var(--text-secondary);margin-bottom:6px;"></div>
+      <div id="cluster-grid"><div class="empty-state">Loading...</div></div>
     </section>
 
     <section id="pool-section">
@@ -483,15 +521,21 @@
             <th>Status</th>
             <th>Partition</th>
             <th>Node</th>
+            <th>Progress</th>
             <th>Elapsed</th>
             <th>Created</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="jobs-tbody">
-          <tr><td colspan="9" class="empty-state">Loading jobs...</td></tr>
+          <tr><td colspan="10" class="empty-state">Loading jobs...</td></tr>
         </tbody>
       </table>
+      <div id="jobs-pagination" style="display:flex;justify-content:center;align-items:center;gap:12px;margin-top:8px;">
+        <button id="page-prev" class="filter-btn" disabled>← Prev</button>
+        <span id="page-info" style="color:var(--text-secondary);font-size:0.85rem;">Page 1</span>
+        <button id="page-next" class="filter-btn">Next →</button>
+      </div>
     </section>
   </main>
 

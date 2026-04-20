@@ -149,11 +149,16 @@ export class Scheduler {
       }
 
       if (entry.executorType === 'slurm_ssh' && this.atSlurmQuota(slurmCount)) {
-        this.logger.info({ slurmCount, max: SLURM_MAX_CONCURRENT }, 'SLURM at quota, stopping dispatch');
-        break;
+        this.logger.info({ slurmCount, max: SLURM_MAX_CONCURRENT }, 'SLURM at quota, skipping SLURM jobs');
+        continue; // Don't block workstation jobs
       }
 
       try {
+        // Prefetch: force refresh host GPU cache before dispatch (workstation)
+        if (entry.executorType === 'workstation_ssh' && 'prefetchGpuStatus' in executor) {
+          await (executor as unknown as { prefetchGpuStatus(): Promise<void> }).prefetchGpuStatus();
+        }
+
         const result = await executor.submit(entry.jobId, entry.spec);
         this.registry.updateJob(entry.jobId, {
           slurmJobId: result.externalJobId,
@@ -164,8 +169,8 @@ export class Scheduler {
         this.logger.info({ poolId: entry.id, jobId: entry.jobId, externalId: result.externalJobId }, 'Dispatched pool job');
       } catch (err) {
         this.logger.error({ err, poolId: entry.id }, 'Failed to dispatch pool job');
-        // Leave in pool for retry
-        break;
+        // Leave in pool for retry, continue to next entry
+        continue;
       }
     }
   }

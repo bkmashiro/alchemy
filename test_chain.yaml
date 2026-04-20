@@ -1,0 +1,27 @@
+version: "1"
+chain:
+  name: test_train_then_eval
+  strategy: sequential
+  failFast: true
+  steps:
+    - stepId: train
+      job:
+        name: test_chain_train
+        command: "echo 'training...' && sleep 30 && echo 'train_loss=0.42' && echo done"
+        resources:
+          partition: a30
+          time: "00:05:00"
+          mem: 4G
+          gpus: 1
+
+    - stepId: eval
+      dependsOn: [train]
+      condition: "status == 'completed'"
+      job:
+        name: test_chain_eval
+        command: "echo 'evaluating...' && sleep 30 && echo 'val_acc=0.85' && echo done"
+        resources:
+          partition: a30
+          time: "00:05:00"
+          mem: 4G
+          gpus: 1

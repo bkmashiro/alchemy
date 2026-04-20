@@ -14,6 +14,9 @@ let logPollTimer = null;
 let allJobsCache = [];
 let allChainsCache = [];
 let gpuPollTimer = null;
+let currentPage = 0;
+const PAGE_SIZE = 30;
+const progressCache = {}; // jobId → { percent, eta, step, total }
 
 // ─── DOM References ──────────────────────────────────────────
 
@@ -40,7 +43,11 @@ const submitResult   = document.getElementById('submit-result');
 const filterBtns     = document.querySelectorAll('.filter-btn');
 const gpuGrid        = document.getElementById('gpu-grid');
 const gpuRefreshBtn  = document.getElementById('gpu-refresh-btn');
+const clusterGrid    = document.getElementById('cluster-grid');
 const poolTbody      = document.getElementById('pool-tbody');
+const pagePrev       = document.getElementById('page-prev');
+const pageNext       = document.getElementById('page-next');
+const pageInfo       = document.getElementById('page-info');
 
 // ─── API Helpers ─────────────────────────────────────────────
 
@@ -86,11 +93,41 @@ function formatTime(iso) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+/**
+ * Parse tqdm progress from log text.
+ * Matches: "Training:   5%|..| 22726/500000 [33:56<13:22:01, 9.92it/s, ...]"
+ */
+function parseTqdmProgress(logText) {
+  if (!logText) return null;
+  // Get last tqdm line (may be \r separated)
+  const lines = logText.replace(/\r/g, '\n').split('\n').filter(l => l.includes('%|'));
+  if (lines.length === 0) return null;
+  const line = lines[lines.length - 1];
+  const m = line.match(/(\d+)%\|.*?\|\s*([\d,]+)\/([\d,]+)\s*\[([^\]<]+)<([^\],]+)/);
+  if (!m) return null;
+  const pct = parseInt(m[1]);
+  const step = parseInt(m[2].replace(/,/g, ''));
+  const total = parseInt(m[3].replace(/,/g, ''));
+  const eta = m[5].trim();
+  return { pct, step, total, eta };
+}
+
 function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/** Parse SLURM elapsed string "D-HH:MM:SS" or "H:MM:SS" or "MM:SS" to seconds */
+function parseElapsedStr(s) {
+  if (!s) return null;
+  let days = 0;
+  if (s.includes('-')) { const [d, rest] = s.split('-'); days = parseInt(d, 10); s = rest; }
+  const parts = s.split(':').map(Number);
+  if (parts.length === 3) return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return days * 86400 + parts[0] * 60 + parts[1];
+  return null;
 }
 
 // ─── Summary Rendering ───────────────────────────────────────
@@ -158,17 +195,66 @@ function renderChains(chains, jobs) {
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timeout', 'cancelled']);
 
+// Status priority: active states first, then terminal by recency
+const STATUS_PRIORITY = { running: 0, submitted: 1, pending: 2, unknown: 3, failed: 4, timeout: 5, completed: 6, cancelled: 7 };
+
+function sortJobs(jobs) {
+  return jobs.slice().sort((a, b) => {
+    const pa = STATUS_PRIORITY[a.status] ?? 9;
+    const pb = STATUS_PRIORITY[b.status] ?? 9;
+    if (pa !== pb) return pa - pb;
+    // Same priority group: newest first
+    const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    return tb - ta;
+  });
+}
+
+let _lastSortedJobs = [];
+let _lastJobsFingerprint = '';
+
 function renderJobs(jobs) {
+  _lastSortedJobs = sortJobs(jobs);
+  const totalPages = Math.max(1, Math.ceil(_lastSortedJobs.length / PAGE_SIZE));
+  if (currentPage >= totalPages) currentPage = totalPages - 1;
+
+  // Skip full DOM rebuild if nothing changed (prevents flicker)
+  const fp = _lastSortedJobs.map(j => `${j.id}:${j.status}:${j.node}:${j.elapsed}`).join('|');
+  if (fp === _lastJobsFingerprint) {
+    // Just update pagination text
+    pagePrev.disabled = currentPage === 0;
+    pageNext.disabled = currentPage >= totalPages - 1;
+    pageInfo.textContent = `Page ${currentPage + 1} / ${totalPages}`;
+    return;
+  }
+  _lastJobsFingerprint = fp;
+  renderJobsPage();
+}
+
+function renderJobsPage() {
+  const jobs = _lastSortedJobs;
+  const totalPages = Math.max(1, Math.ceil(jobs.length / PAGE_SIZE));
+
   if (jobs.length === 0) {
-    jobsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">No jobs found.</td></tr>`;
+    jobsTbody.innerHTML = `<tr><td colspan="10" class="empty-state">No jobs found.</td></tr>`;
+    pagePrev.disabled = true;
+    pageNext.disabled = true;
+    pageInfo.textContent = 'Page 1 / 1';
     return;
   }
 
-  jobsTbody.innerHTML = jobs.map(job => {
+  const start = currentPage * PAGE_SIZE;
+  const pageJobs = jobs.slice(start, start + PAGE_SIZE);
+
+  pagePrev.disabled = currentPage === 0;
+  pageNext.disabled = currentPage >= totalPages - 1;
+  pageInfo.textContent = `Page ${currentPage + 1} / ${totalPages}`;
+
+  jobsTbody.innerHTML = pageJobs.map(job => {
     const isSelected = job.id === selectedJobId ? ' selected' : '';
     const name   = escapeHtml(job.spec?.name ?? '—');
     const slurmId = job.slurmJobId ?? '—';
-    const partition = job.spec?.resources?.partition ?? '—';
+    const partition = job.executorType === 'workstation_ssh' ? 'ws' : (job.spec?.resources?.partition ?? '—');
     const node   = job.node ?? '—';
     const elapsed = formatElapsed(job.elapsed);
     const created = formatTime(job.createdAt);
@@ -184,12 +270,30 @@ function renderJobs(jobs) {
         <td>${statusBadge(job.status)}</td>
         <td class="dim">${partition}</td>
         <td class="dim">${node}</td>
+        <td class="no-wrap dim" id="prog-${job.id}">${progressCache[job.id] ? `${progressCache[job.id].percent}% ${progressCache[job.id].eta ? '(' + progressCache[job.id].eta + ')' : ''}` : '—'}</td>
         <td class="no-wrap">${elapsed}</td>
         <td class="dim no-wrap">${created}</td>
         <td>${cancelCell}</td>
       </tr>
     `;
   }).join('');
+}
+
+// Fetch and display progress for running jobs
+async function updateProgress() {
+  try {
+    const data = await api('/api/progress');
+    for (const [jobId, info] of Object.entries(data)) {
+      const p = info?.progress;
+      if (p) {
+        progressCache[jobId] = p;
+        const el = document.getElementById(`prog-${jobId}`);
+        if (!el) continue;
+        el.textContent = `${p.percent}% ${p.eta ? '(' + p.eta + ')' : ''}`;
+        el.title = `${p.step.toLocaleString()} / ${p.total.toLocaleString()}`;
+      }
+    }
+  } catch { /* ignore */ }
 }
 
 async function cancelJob(event, jobId, jobName) {
@@ -297,6 +401,35 @@ async function handleSubmit() {
 
 // ─── GPU Status Rendering ─────────────────────────────────────
 
+/** Build a map of hostname → [{jobId, jobName}] from allJobsCache */
+function getHostJobMap() {
+  const map = {};
+  for (const job of allJobsCache) {
+    if (job.status !== 'running' && job.status !== 'submitted') continue;
+    if (!job.slurmJobId) continue;
+    // Workstation jobs: ws:<host>:<pid>
+    if (job.slurmJobId.startsWith('ws:')) {
+      const host = job.slurmJobId.split(':')[1];
+      if (host) (map[host] = map[host] || []).push({ id: job.id, name: job.spec?.name ?? '?' });
+    }
+    // SLURM jobs: match by node field
+    else if (job.node) {
+      (map[job.node] = map[job.node] || []).push({ id: job.id, name: job.spec?.name ?? '?' });
+    }
+  }
+  return map;
+}
+
+function scrollToJob(jobId, jobName) {
+  const row = document.querySelector(`#jobs-tbody tr[data-id="${jobId}"]`);
+  if (row) {
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.classList.add('highlight-flash');
+    setTimeout(() => row.classList.remove('highlight-flash'), 1500);
+    openLogs(jobId, jobName, row.querySelector('.status-badge')?.textContent ?? 'running');
+  }
+}
+
 function renderGpuStatus(hosts) {
   if (!gpuGrid) return;
   if (!hosts || hosts.length === 0) {
@@ -304,17 +437,42 @@ function renderGpuStatus(hosts) {
     return;
   }
 
+  const hostJobs = getHostJobMap();
+
   gpuGrid.innerHTML = hosts.map(h => {
-    const pct = h.totalVram > 0 ? Math.round((h.usedVram / h.totalVram) * 100) : 0;
-    const cardClass = !h.reachable ? 'unreachable' : h.hasForeignProcess ? 'foreign' : h.available ? 'available' : 'busy';
+    const vramPct = h.totalVram > 0 ? Math.round((h.usedVram / h.totalVram) * 100) : 0;
+    const utilPct = Math.min(h.gpuUtil, 100);
+    const utilColor = utilPct > 80 ? 'var(--red)' : utilPct > 40 ? 'var(--yellow)' : 'var(--green)';
+    const age = h.lastQueried ? Math.round((Date.now() - h.lastQueried) / 1000) : null;
+    const stale = age !== null && age > 600; // >10min
+    const cardClass = stale ? 'stale' : !h.reachable ? 'unreachable' : h.hasForeignProcess ? 'foreign' : h.available ? 'available' : 'busy';
     const statusLabel = !h.reachable ? 'unreachable' : h.hasForeignProcess ? 'foreign proc' : h.available ? 'available' : 'busy';
+    const ageLabel = age === null ? '' : age < 60 ? `${age}s ago` : `${Math.round(age / 60)}m ago`;
+
+    // Jobs running on this host
+    const jobs = hostJobs[h.host] || [];
+    const jobsHtml = jobs.length > 0
+      ? `<div class="gpu-card-jobs">${jobs.map(j =>
+          `<a class="gpu-job-link" href="#" onclick="event.preventDefault();scrollToJob('${j.id}','${escapeHtml(j.name)}')">${escapeHtml(j.name)}</a>`
+        ).join('')}</div>`
+      : '';
+
     return `
       <div class="gpu-card ${cardClass}">
         <div class="gpu-card-name">${escapeHtml(h.host)}</div>
-        <div class="gpu-card-type">${escapeHtml(h.gpuType)}</div>
-        <div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:${pct}%"></div></div>
+        <div class="gpu-card-type">${escapeHtml(h.gpuType)}${ageLabel ? ' · <span class="gpu-age">' + ageLabel + '</span>' : ''}</div>
+        <div class="gpu-bar-group">
+          <div class="gpu-bar-label">VRAM</div>
+          <div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:${vramPct}%"></div></div>
+          <div class="gpu-bar-value">${h.usedVram}/${h.totalVram}G</div>
+        </div>
+        <div class="gpu-bar-group">
+          <div class="gpu-bar-label">Util</div>
+          <div class="gpu-vram-bar"><div class="gpu-vram-fill" style="width:${utilPct}%;background:${utilColor}"></div></div>
+          <div class="gpu-bar-value">${h.gpuUtil}%</div>
+        </div>
+        ${jobsHtml}
         <div class="gpu-card-meta">
-          <span>${h.usedVram}/${h.totalVram} GB · ${h.gpuUtil}% util</span>
           <span>${statusLabel}</span>
         </div>
       </div>
@@ -329,6 +487,92 @@ async function pollGpu() {
   } catch {
     if (gpuGrid) gpuGrid.innerHTML = '<div class="empty-state">GPU status unavailable</div>';
   }
+  try {
+    const cluster = await api('/api/cluster-status');
+    renderClusterStatus(cluster);
+  } catch {
+    if (clusterGrid) clusterGrid.innerHTML = '<div class="empty-state">Cluster unavailable</div>';
+  }
+}
+
+// ─── Cluster Rendering ──────────────────────────────────────────
+
+function renderClusterStatus(data) {
+  if (!clusterGrid) return;
+  const nodes = data.nodes || [];
+  const jobs = data.jobs || [];
+  const gpuUsed = data.gpuUsedByNode || {};
+  const otherJobs = data.otherJobsByNode || {};
+  if (nodes.length === 0) {
+    clusterGrid.innerHTML = '<div class="empty-state">No SLURM nodes found</div>';
+    return;
+  }
+
+  // Build job map: node → [job names] (our jobs only)
+  const jobMap = {};
+  for (const j of jobs) {
+    if (!j.node || j.node === '(None)') continue;
+    for (const n of j.node.split(',')) {
+      (jobMap[n] = jobMap[n] || []).push(j.name);
+    }
+  }
+
+  // Deduplicate nodes — keep the entry with the most specific gpuType
+  const bestNode = {};
+  for (const n of nodes) {
+    const prev = bestNode[n.name];
+    if (!prev || (prev.gpuType === 'gpu' && n.gpuType !== 'gpu') || (prev.gpuCount === 0 && n.gpuCount > 0)) {
+      bestNode[n.name] = n;
+    }
+  }
+  const unique = Object.values(bestNode);
+
+  // Compute free GPUs per node for sorting
+  const freeGpus = (n) => Math.max(0, n.gpuCount - (gpuUsed[n.name] || 0));
+
+  // Sort: most free GPUs first, then by state
+  const stateOrder = { idle: 0, mixed: 1, allocated: 2, down: 3, drain: 4, drained: 4 };
+  unique.sort((a, b) => {
+    const fa = freeGpus(a), fb = freeGpus(b);
+    if (fa !== fb) return fb - fa; // more free first
+    return (stateOrder[a.state] ?? 3) - (stateOrder[b.state] ?? 3);
+  });
+
+  // Render summary by partition/gpuType
+  const summaryEl = document.getElementById('cluster-summary');
+  if (summaryEl) {
+    const byType = {};
+    for (const n of unique) {
+      const t = n.gpuType;
+      if (!byType[t]) byType[t] = { total: 0, free: 0 };
+      byType[t].total += n.gpuCount;
+      byType[t].free += freeGpus(n);
+    }
+    const parts = Object.entries(byType)
+      .sort((a, b) => b[1].free - a[1].free)
+      .map(([t, v]) => `${t}: <span class="${v.free > 0 ? 'gpu-free' : 'gpu-none'}">${v.free}</span>/${v.total}`)
+      .join(' · ');
+    summaryEl.innerHTML = `Free GPUs — ${parts}`;
+  }
+
+  clusterGrid.innerHTML = unique.map(n => {
+    const stateClass = n.state.replace(/[*~#$]+/g, '').split(/[+]/)[0];
+    const used = gpuUsed[n.name] || 0;
+    const free = Math.max(0, n.gpuCount - used);
+    const full = free === 0 && n.gpuCount > 0;
+    const myJobs = jobMap[n.name];
+    const jobHtml = myJobs ? `<div class="cluster-node-job">${myJobs.map(escapeHtml).join(', ')}</div>` : '';
+    const othersCount = otherJobs[n.name] || 0;
+    const othersHtml = othersCount > 0 ? `<div class="cluster-node-others">others ×${othersCount}</div>` : '';
+    return `
+      <div class="cluster-node ${stateClass}${full ? ' full' : ''}">
+        <div class="cluster-node-name">${escapeHtml(n.name)}</div>
+        <div class="cluster-node-meta">${escapeHtml(n.gpuType)}×${n.gpuCount} · <span class="${free > 0 ? 'gpu-free' : 'gpu-none'}">${free} free</span> · ${n.state}</div>
+        ${jobHtml}
+        ${othersHtml}
+      </div>
+    `;
+  }).join('');
 }
 
 // ─── Pool Rendering ───────────────────────────────────────────
@@ -391,19 +635,37 @@ async function pollPool() {
 async function poll() {
   try {
     const statusParam = currentFilter !== 'all' ? `&status=${currentFilter}` : '';
-    const [summaryData, jobsData, chainsData] = await Promise.all([
+    const [summaryData, jobsData, chainsData, clusterData] = await Promise.all([
       api('/api/summary'),
       api(`/api/jobs?limit=100${statusParam}`),
       api('/api/chains?limit=30'),
+      api('/api/cluster-status').catch(() => ({ jobs: [] })),
     ]);
 
     allJobsCache   = jobsData.jobs   || [];
     allChainsCache = chainsData.chains || [];
 
+    // Merge untracked SLURM jobs into the job list
+    const trackedSlurmIds = new Set(allJobsCache.map(j => j.slurmJobId).filter(Boolean));
+    const slurmJobs = (clusterData.jobs || [])
+      .filter(sj => !trackedSlurmIds.has(sj.jobId))
+      .map(sj => ({
+        id: `slurm-${sj.jobId}`,
+        slurmJobId: sj.jobId,
+        spec: { name: sj.name, resources: { partition: sj.partition } },
+        status: sj.state.toLowerCase() === 'running' ? 'running' : sj.state.toLowerCase(),
+        node: sj.node,
+        elapsed: parseElapsedStr(sj.elapsed),
+        createdAt: null,
+        _untracked: true,
+      }));
+    const mergedJobs = [...slurmJobs, ...allJobsCache];
+
     renderSummary(summaryData);
-    renderJobs(allJobsCache);
+    renderJobs(mergedJobs);
     renderChains(allChainsCache, allJobsCache);
     pollPool();
+    updateProgress();
 
     connectionStatus.textContent = '● live';
     connectionStatus.className = 'ok';
@@ -420,11 +682,15 @@ logClose.addEventListener('click', closeLogs);
 logRefreshBtn.addEventListener('click', refreshLogs);
 logCopyBtn.addEventListener('click', copyLogs);
 
+pagePrev.addEventListener('click', () => { if (currentPage > 0) { currentPage--; renderJobsPage(); } });
+pageNext.addEventListener('click', () => { currentPage++; renderJobsPage(); });
+
 filterBtns.forEach(btn => {
   btn.addEventListener('click', () => {
     filterBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     currentFilter = btn.dataset.filter;
+    currentPage = 0;
     poll();
   });
 });
@@ -469,6 +735,6 @@ if (gpuRefreshBtn) {
 poll();
 setInterval(poll, POLL_INTERVAL);
 
-// GPU status polls less frequently (every 30s) since SSH queries are expensive
+// GPU status — backend handles tiered caching, frontend polls every 60s
 pollGpu();
-gpuPollTimer = setInterval(pollGpu, 30000);
+gpuPollTimer = setInterval(pollGpu, 60000);
